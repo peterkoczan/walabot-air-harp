@@ -254,6 +254,7 @@ PADS = [
 ENERGY_THRESHOLD        = 200   # adjustable via slider (lower = more sensitive)
 RELEASE_THRESHOLD_RATIO = 0.75  # hysteresis: release at 75% of trigger threshold
 BAR_MAX                 = 1200  # energy level that maxes out the glow
+EMA_ALPHA               = 0.4   # EMA smoothing factor per zone per frame
 
 # Far zone boost — signal attenuates ~R^4; hands at 90 cm return far less energy
 FAR_BOOST        = 5.0
@@ -349,6 +350,8 @@ class HarpApp(tk.Frame):
         self.pad_is_active   = {p[0]: False for p in PADS}
         # Energy from the previous frame — used for velocity gate
         self.prev_energies   = {p[0]: 0.0   for p in PADS}
+        # EMA-smoothed energies (alpha=EMA_ALPHA) — reduces single-frame jitter
+        self.ema_energies    = {p[0]: 0.0   for p in PADS}
         # Per-pad elevation angle from GetSensorTargets() — drives pitch shift
         self.pad_theta       = {p[0]: 0.0   for p in PADS}
         # MIDI state
@@ -588,7 +591,8 @@ class HarpApp(tk.Frame):
         ]
 
         self.statusVar.set('Ready — wave hands through zones to play  ·  keep moving to sustain')
-        self.prev_energies = {p[0]: 0.0 for p in PADS}  # reset before first loop
+        self.prev_energies = {p[0]: 0.0 for p in PADS}
+        self.ema_energies  = {p[0]: 0.0 for p in PADS}
         self.cycleId = self.after(LOOP_MS, self.loop)
 
     def loop(self):
@@ -622,20 +626,24 @@ class HarpApp(tk.Frame):
             e *= boost
             energies[pid] = e
 
+        # ── EMA smoothing: eliminate single-frame jitter before threshold test ──
+        for pid in self.ema_energies:
+            self.ema_energies[pid] = (EMA_ALPHA * energies[pid]
+                                      + (1.0 - EMA_ALPHA) * self.ema_energies[pid])
+
         now = time.monotonic()
 
-        # ── Hysteresis (Schmitt trigger) ──────────────────────────────────────
+        # ── Hysteresis (Schmitt trigger) on smoothed energy ───────────────────
         # Trigger at thresh, release at thresh × RELEASE_THRESHOLD_RATIO.
         # Prevents flicker when a hand hovers at the detection boundary.
         release_thresh = thresh * RELEASE_THRESHOLD_RATIO
         for pid in self.pad_is_active:
-            e = energies[pid]
+            e = self.ema_energies[pid]
             if self.pad_is_active[pid]:
                 if e < release_thresh:
                     self.pad_is_active[pid] = False
             else:
-                # Velocity gate: only trigger when energy is rising (positive delta).
-                # Prevents false triggers from a hand drifting slowly into a zone.
+                # Velocity gate: only trigger when smoothed energy is rising.
                 if e > thresh and e > self.prev_energies[pid]:
                     self.pad_is_active[pid] = True
 
@@ -654,7 +662,7 @@ class HarpApp(tk.Frame):
         right_active = False
 
         for pid, label, r_idx, phi_idx, col_idle, col_active, wav, boost in PADS:
-            energy = energies[pid]
+            energy = self.ema_energies[pid]   # use EMA-smoothed value for glow + display
 
             # ── Sustain timestamp ─────────────────────────────────────────────
             # Record the last time this pad was above threshold.
@@ -758,7 +766,7 @@ class HarpApp(tk.Frame):
         else:
             self.statusVar.set('Ready \u2014 wave through zones to play  \u00b7  keep moving to sustain')
 
-        self.prev_energies = dict(energies)
+        self.prev_energies = dict(self.ema_energies)
         self.cycleId = self.after(LOOP_MS, self.loop)
 
 
