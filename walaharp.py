@@ -473,6 +473,9 @@ class HarpApp(tk.Frame):
         self.pad_freq  = dict(_NOTE_FREQ)
         # Schmitt trigger state: True while pad is considered "active" (hysteresis)
         self.pad_is_active   = {p[0]: False for p in PADS}
+        # Previous-frame pad_is_active — used to detect falling edges for latch mode
+        self.pad_was_active  = {p[0]: False for p in PADS}
+        self.latch_mode      = False
         # Energy from the previous frame — used for velocity gate
         self.prev_energies   = {p[0]: 0.0   for p in PADS}
         # EMA-smoothed energies (alpha=EMA_ALPHA) — reduces single-frame jitter
@@ -618,7 +621,7 @@ class HarpApp(tk.Frame):
         # Second row: tuning indicator
         bar2 = tk.Frame(self, bg='#0a0a0a')
         bar2.pack(fill=tk.X, padx=8, pady=(0, 2))
-        self.tuningVar = tk.StringVar(value='Tuning: A min pent  [1] pent  [2] slendro  [3] pyth  [4] blues  [k] KS/WAV')
+        self.tuningVar = tk.StringVar(value='Tuning: A min pent  [1-4]  [k] KS  [l] HOLD')
         tk.Label(bar2, textvariable=self.tuningVar, font='TkFixedFont 7',
                  bg='#0a0a0a', fg='#445544', anchor=tk.W).pack(side=tk.LEFT)
 
@@ -643,6 +646,18 @@ class HarpApp(tk.Frame):
             self.modeBtn.config(bg='#1a2a1a', fg='#44cc44',
                                 activebackground='#2a3a2a',
                                 activeforeground='#66ff66')
+
+    def _toggle_latch(self, _event=None):
+        self.latch_mode = not self.latch_mode
+        self._update_tuning_label()
+        mode_label = 'LATCH (fire on exit)' if self.latch_mode else 'HOLD (fire on entry)'
+        self.statusVar.set(mode_label)
+
+    def _update_tuning_label(self):
+        name, _ = _TUNINGS[self.tuning_id]
+        ks_label   = 'KS' if KS_MODE else 'WAV'
+        latch_label = '  [l] LATCH' if self.latch_mode else '  [l] HOLD'
+        self.tuningVar.set('Tuning: {}  [1-4]  [k] {}{}' .format(name, ks_label, latch_label))
 
     def _reset(self):
         for pid in self.pad_hits:
@@ -685,15 +700,12 @@ class HarpApp(tk.Frame):
             _KS_CACHE.clear()
             for freq in freqs:
                 _ks_ensure(freq)
-        ks_label = 'KS' if KS_MODE else 'WAV'
-        self.tuningVar.set('Tuning: {}  [1-4] switch  [k] {}'.format(name, ks_label))
+        self._update_tuning_label()
 
     def _toggle_ks(self, _event=None):
         global KS_MODE
         KS_MODE = not KS_MODE
-        name, _ = _TUNINGS[self.tuning_id]
-        ks_label = 'KS' if KS_MODE else 'WAV'
-        self.tuningVar.set('Tuning: {}  [1-4] switch  [k] {}'.format(name, ks_label))
+        self._update_tuning_label()
 
     def _init_walabot(self):
         wlbt.Init()
@@ -805,8 +817,12 @@ class HarpApp(tk.Frame):
                 if e > thresh and e > self.prev_energies[pid]:
                     self.pad_is_active[pid] = True
 
-        # ── 1-HAND vs 2-HAND mode ─────────────────────────────────────────────
-        if self.mode == '1-HAND':
+        # ── Latch-on-release: detect falling edges (was active, now inactive) ──
+        if self.latch_mode:
+            active = {pid for pid in self.pad_was_active
+                      if self.pad_was_active[pid] and not self.pad_is_active[pid]}
+        # ── 1-HAND vs 2-HAND mode (normal / non-latch) ───────────────────────
+        elif self.mode == '1-HAND':
             best_pid = max(energies, key=lambda p: energies[p])
             active = {best_pid} if self.pad_is_active[best_pid] else set()
             for pid in list(self.pad_is_active):
@@ -814,6 +830,8 @@ class HarpApp(tk.Frame):
                     self.pad_is_active[pid] = False
         else:
             active = {pid for pid, v in self.pad_is_active.items() if v}
+
+        self.pad_was_active = dict(self.pad_is_active)
 
         playing      = []
         left_active  = False
@@ -942,6 +960,7 @@ def main():
     root.bind('d', app._toggle_debug)
     root.bind('m', app._toggle_midi)
     root.bind('k', app._toggle_ks)
+    root.bind('l', app._toggle_latch)
     for n in range(1, 5):
         root.bind(str(n), lambda e, _n=n: app._switch_tuning(_n))
     root.update_idletasks()
