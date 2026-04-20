@@ -139,7 +139,7 @@ PADS = [
     ('d4', 'D4', 0, 2, '#082818', '#22aa66', _wav('d4'), 1.0),  # inner-right near
     ('e4', 'E4', 0, 3, '#182808', '#88cc22', _wav('e4'), 1.8),  # outer-right near
 
-    ('g4', 'G4', 1, 0, '#281800', '#cc7700', _wav('g4'), 2.5),  # outer-left  far  ← boosted
+    ('g4', 'G4', 1, 0, '#281800', '#cc7700', _wav('g4'), 1.5),  # outer-left  far
     ('a4', 'A4', 1, 1, '#280018', '#dd3388', _wav('a4'), 1.0),  # inner-left  far
     ('c5', 'C5', 1, 2, '#002828', '#22cccc', _wav('c5'), 1.0),  # inner-right far
     ('e5', 'E5', 1, 3, '#1c1800', '#ddcc22', _wav('e5'), 2.5),  # outer-right far  ← boosted
