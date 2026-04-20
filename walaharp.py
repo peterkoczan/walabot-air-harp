@@ -14,7 +14,7 @@ Multiple zones play simultaneously — any combination is in tune.
 Run generate_sounds.py once first to create the WAV files.
 """
 from __future__ import print_function, division
-import os, math, subprocess, signal, platform, threading, wave, struct, time
+import os, math, subprocess, signal, platform, threading, wave, struct, time, collections
 import WalabotAPI as wlbt
 try:
     import tkinter as tk
@@ -34,14 +34,60 @@ def _wav(name):
     return os.path.join(_DIR, name + '.wav')
 
 
+# Shared frame data for each WAV path — loaded once, reused across _WavStream instances
+_WAV_FRAME_CACHE = {}
+
+
+class _WavStream:
+    """Pre-loaded WAV with fractional-position interpolation for real-time pitch shift."""
+
+    def __init__(self, path):
+        if path not in _WAV_FRAME_CACHE:
+            with wave.open(path, 'rb') as wf:
+                n = wf.getnframes()
+                _WAV_FRAME_CACHE[path] = struct.unpack('<%dh' % n, wf.readframes(n))
+        self._frames = _WAV_FRAME_CACHE[path]
+        self._total  = len(self._frames)
+        self._pos    = 0.0
+        self.pitch   = 1.0   # >1 = faster/higher, <1 = slower/lower
+
+    def read(self, n_out):
+        """Return (data_bytes, exhausted).  Interpolates at fractional positions."""
+        frames = self._frames
+        total  = self._total
+        pos    = self._pos
+        pitch  = self.pitch
+        out    = []
+        for _ in range(n_out):
+            i = int(pos)
+            if i >= total - 1:
+                self._pos = pos
+                return struct.pack('<%dh' % len(out), *out), True
+            frac = pos - i
+            out.append(int(frames[i] + frac * (frames[i + 1] - frames[i])))
+            pos += pitch
+        self._pos = pos
+        return struct.pack('<%dh' % n_out, *out), False
+
+    def remaining_ms(self, rate):
+        frames_left = max(0, self._total - 1 - int(self._pos))
+        return frames_left / max(0.01, self.pitch) / rate * 1000
+
+
 class _Mixer:
     """Single persistent aplay + in-process PCM mixer for simultaneous tones."""
-    RATE  = 44100
-    CHUNK = 256   # ~6 ms per chunk
+    RATE              = 44100
+    CHUNK             = 256   # ~6 ms per chunk
+    ECHO_DELAY_CHUNKS = 55    # ~320 ms reverb delay
+    ECHO_GAIN         = 0.18  # echo amplitude (single-tap delay, no buildup)
 
     def __init__(self):
-        self._streams = []
-        self._lock    = threading.Lock()
+        self._streams  = []
+        self._lock     = threading.Lock()
+        # Pre-fill echo buffer with silence so the first 320 ms plays clean
+        self._echo_buf = collections.deque(
+            ([0] * self.CHUNK for _ in range(self.ECHO_DELAY_CHUNKS)),
+            maxlen=self.ECHO_DELAY_CHUNKS)
         self._proc    = subprocess.Popen(
             ['aplay', '-q', '-t', 'raw', '-f', 'S16_LE',
              '-r', str(self.RATE), '-c', '1', '-'],
@@ -51,76 +97,77 @@ class _Mixer:
         threading.Thread(target=self._run, daemon=True).start()
 
     def play(self, path):
-        """Open WAV and add to mix.  Returns the wave object so the caller
-        can stop it later via stop()."""
+        """Create a _WavStream for path, add to mix, return the stream object."""
         try:
-            wf = wave.open(path, 'rb')
+            stream = _WavStream(path)
             with self._lock:
-                self._streams.append(wf)
-            return wf
+                self._streams.append(stream)
+            return stream
         except Exception:
             return None
 
-    def stop(self, wf):
-        """Remove a specific wave stream from the mix immediately.
-        Safe to call with None or an already-finished stream."""
-        if wf is None:
+    def stop(self, stream):
+        """Remove a stream from the mix immediately (safe if already finished)."""
+        if stream is None:
             return
         with self._lock:
             try:
-                self._streams.remove(wf)
-                wf.close()
-            except (ValueError, Exception):
-                pass   # already finished naturally — no-op
+                self._streams.remove(stream)
+            except ValueError:
+                pass
 
-    def remaining_ms(self, wf):
-        """Return milliseconds of audio remaining in a wav stream.
-        Thread-safe: acquires the lock while reading the wav position."""
-        if wf is None:
+    def remaining_ms(self, stream):
+        """Milliseconds of audio left in stream at its current pitch rate."""
+        if stream is None:
             return 0
         with self._lock:
             try:
-                remaining = max(0, wf.getnframes() - wf.tell())
-                return remaining / self.RATE * 1000
+                return stream.remaining_ms(self.RATE) if stream in self._streams else 0
             except Exception:
                 return 0
+
+    def set_pitch(self, stream, factor):
+        """Update the playback-rate factor for a live stream (thread-safe)."""
+        if stream is None:
+            return
+        with self._lock:
+            if stream in self._streams:
+                stream.pitch = max(0.5, min(2.0, factor))
 
     def _run(self):
         """Real-time paced loop: keeps the OS pipe near-empty so audio plays
         within ~10 ms of a hit instead of waiting for buffered silence to drain."""
         silence  = b'\x00' * self.CHUNK * 2
-        # Write at exactly real-time pace (1 chunk per chunk-duration).
-        # This keeps the OS pipe near-empty so new notes start playing within
-        # ~1 chunk (~6 ms) rather than waiting for a backlog to drain.
-        # It also ensures each 2.5-second WAV is consumed in exactly 2.5 s,
-        # matching the scan-loop countdown — prevents the wav running out
-        # ~260 ms early (which caused notes to go silent mid-sustain).
         interval = self.CHUNK / self.RATE
         while True:
             t0 = time.monotonic()
 
             with self._lock:
                 alive, chunks = [], []
-                for wf in self._streams:
-                    data = wf.readframes(self.CHUNK)
+                for stream in self._streams:
+                    data, done = stream.read(self.CHUNK)
                     if data:
                         chunks.append(data)
-                        alive.append(wf)
-                    else:
-                        wf.close()
+                    if not done:
+                        alive.append(stream)
                 self._streams = alive
 
-            if chunks:
-                out = [0] * self.CHUNK
-                for data in chunks:
-                    for i, s in enumerate(
-                            struct.unpack('<%dh' % (len(data) // 2), data)):
-                        out[i] += s
-                # Per-chunk peak normalisation: if the mix exceeds ±32767 scale
-                # it down to fit exactly.  No inter-chunk memory → no pumping
-                # artifact when a new note is triggered alongside existing ones.
-                # With PEAK=0.25 in the WAV files, 4 simultaneous notes sum to
-                # exactly 1.0 — normalisation only fires on edge cases (5+ notes).
+            # Mix all active streams
+            out = [0] * self.CHUNK
+            for data in chunks:
+                for i, s in enumerate(
+                        struct.unpack('<%dh' % (len(data) // 2), data)):
+                    out[i] += s
+
+            # Echo / reverb tail: blend in a ~320 ms delayed copy.
+            # Dry signal stored BEFORE adding echo — single-tap delay, no buildup.
+            echo_frame = self._echo_buf[0]
+            self._echo_buf.append(list(out))
+            for i in range(self.CHUNK):
+                out[i] += int(echo_frame[i] * self.ECHO_GAIN)
+
+            if any(out):
+                # Per-chunk peak normalisation: no inter-chunk memory → no pumping.
                 peak = max(abs(s) for s in out)
                 if peak > 32767:
                     factor = 32767.0 / peak
@@ -135,9 +182,6 @@ class _Mixer:
             except (BrokenPipeError, OSError):
                 break
 
-            # Pace the loop: sleep for the remaining fraction of a chunk period.
-            # This keeps the OS pipe almost empty so the next note plays
-            # immediately without draining a backlog of buffered silence.
             elapsed   = time.monotonic() - t0
             remaining = interval - elapsed
             if remaining > 0:
@@ -149,7 +193,27 @@ if _SYSTEM == 'Linux':
     def _play(path):         return _mixer.play(path)
     def _stop(wf):           _mixer.stop(wf)
     def _remaining_ms(wf):   return _mixer.remaining_ms(wf)
-elif _SYSTEM == 'Darwin':
+
+# ── Optional MIDI output ───────────────────────────────────────────────────────
+# Requires mido + python-rtmidi.  Gracefully disabled if unavailable.
+_MIDI_OK   = False
+_midi_port = None
+try:
+    import mido as _mido
+    _midi_port = _mido.open_output('WalaHarp', virtual=True)
+    _MIDI_OK   = True
+except Exception:
+    pass
+
+# MIDI note number and channel (0-indexed) per pad — MPE style (ch 0-7 = MIDI 1-8)
+_PAD_MIDI_NOTE = {
+    'a3': 57, 'd4': 62, 'g4': 67, 'c5': 72,   # left hand
+    'c4': 60, 'e4': 64, 'a4': 69, 'e5': 76,   # right hand
+}
+_PAD_MIDI_CH = {pid: idx for idx, pid in enumerate(
+    ['a3', 'd4', 'g4', 'c5', 'c4', 'e4', 'a4', 'e5'])}  # ch 0-7
+
+if _SYSTEM == 'Darwin':
     def _play(path):
         subprocess.Popen(['afplay', path],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -187,8 +251,9 @@ PADS = [
 ]
 
 # ── Detection / sustain constants ─────────────────────────────────────────────
-ENERGY_THRESHOLD = 200   # adjustable via slider (lower = more sensitive)
-BAR_MAX          = 1200  # energy level that maxes out the glow
+ENERGY_THRESHOLD        = 200   # adjustable via slider (lower = more sensitive)
+RELEASE_THRESHOLD_RATIO = 0.75  # hysteresis: release at 75% of trigger threshold
+BAR_MAX                 = 1200  # energy level that maxes out the glow
 
 # Far zone boost — signal attenuates ~R^4; hands at 90 cm return far less energy
 FAR_BOOST        = 5.0
@@ -209,7 +274,7 @@ RETRIGGER_FRAMES = 6     # safety fallback (unused when rem_ms path works)
 # ── Walabot arena ─────────────────────────────────────────────────────────────
 R_MIN, R_MAX, R_RES             = 20, 90, 5   # 20–90 cm: hands low → hands raised high
 PHI_MIN, PHI_MAX, PHI_RES       = -60, 60, 3
-THETA_MIN, THETA_MAX, THETA_RES = -1, 1, 1
+THETA_MIN, THETA_MAX, THETA_RES = -20, 20, 5   # wide range for theta expression
 
 # ── Canvas geometry ───────────────────────────────────────────────────────────
 CW, CH = 700, 470
@@ -280,6 +345,18 @@ class HarpApp(tk.Frame):
         # making notes immune to any duration of radar interference from a
         # second hand — no hold-window expiry, just a real-time clock check.
         self.pad_last_active = {p[0]: 0.0 for p in PADS}
+        # Schmitt trigger state: True while pad is considered "active" (hysteresis)
+        self.pad_is_active   = {p[0]: False for p in PADS}
+        # Energy from the previous frame — used for velocity gate
+        self.prev_energies   = {p[0]: 0.0   for p in PADS}
+        # Per-pad elevation angle from GetSensorTargets() — drives pitch shift
+        self.pad_theta       = {p[0]: 0.0   for p in PADS}
+        # MIDI state
+        self.midi_enabled    = False
+        self.midi_note_on    = {p[0]: False for p in PADS}
+        self.midi_throttle   = 0   # frame counter — send CC every 4 frames (~80 ms)
+        self.debug_mode = False
+        self.energy_ids = {}
 
         self.statusVar = tk.StringVar(value='Connecting...')
         tk.Label(self, textvariable=self.statusVar, font='TkFixedFont 9',
@@ -366,6 +443,10 @@ class HarpApp(tk.Frame):
             self.label_ids[pid] = c.create_text(
                 cx, cy, text=label, fill='#aaaaaa',
                 font='TkFixedFont 10 bold', anchor=tk.CENTER)
+            # Debug energy readout — hidden until 'd' key pressed
+            self.energy_ids[pid] = c.create_text(
+                cx, cy + 12, text='', fill='#ffcc44',
+                font='TkFixedFont 7', anchor=tk.CENTER)
 
     def _build_controls(self):
         bar = tk.Frame(self, bg='#0a0a0a')
@@ -381,6 +462,17 @@ class HarpApp(tk.Frame):
                  activebackground='#444', highlightthickness=0,
                  font='TkFixedFont 7', length=440, sliderlength=12,
                  bd=0).pack(side=tk.LEFT)
+
+        # MIDI toggle button — always visible; greyed if mido unavailable
+        self.midiVar = tk.StringVar(value='MIDI OFF')
+        self.midiBtn = tk.Button(bar, textvariable=self.midiVar,
+                  font='TkFixedFont 8 bold',
+                  bg='#1a1a1a', fg='#555555',
+                  activebackground='#2a2a2a', activeforeground='#888888',
+                  relief=tk.FLAT, bd=1, padx=6,
+                  state=tk.NORMAL if _MIDI_OK else tk.DISABLED,
+                  command=self._toggle_midi)
+        self.midiBtn.pack(side=tk.RIGHT, padx=(4, 0))
 
         self.modeVar = tk.StringVar(value='2-HAND')
         self.modeBtn = tk.Button(bar, textvariable=self.modeVar,
@@ -420,6 +512,32 @@ class HarpApp(tk.Frame):
     def _reset(self):
         for pid in self.pad_hits:
             self.pad_hits[pid] = 0
+
+    def _toggle_debug(self, _event=None):
+        self.debug_mode = not self.debug_mode
+        if not self.debug_mode:
+            for pid in self.energy_ids:
+                self.canvas.itemconfig(self.energy_ids[pid], text='')
+
+    def _toggle_midi(self, _event=None):
+        if not _MIDI_OK:
+            return
+        self.midi_enabled = not self.midi_enabled
+        if self.midi_enabled:
+            self.midiVar.set('MIDI ON')
+            self.midiBtn.config(bg='#1a2a1a', fg='#44cc44',
+                                activebackground='#2a3a2a', activeforeground='#66ff66')
+        else:
+            self.midiVar.set('MIDI OFF')
+            self.midiBtn.config(bg='#1a1a1a', fg='#555555',
+                                activebackground='#2a2a2a', activeforeground='#888888')
+            # Send NoteOff for any sustained MIDI notes
+            for pid in self.midi_note_on:
+                if self.midi_note_on[pid]:
+                    ch = _PAD_MIDI_CH[pid]
+                    _midi_port.send(_mido.Message('note_off', channel=ch,
+                                                  note=_PAD_MIDI_NOTE[pid], velocity=0))
+                    self.midi_note_on[pid] = False
 
     def _init_walabot(self):
         wlbt.Init()
@@ -470,6 +588,7 @@ class HarpApp(tk.Frame):
         ]
 
         self.statusVar.set('Ready — wave hands through zones to play  ·  keep moving to sustain')
+        self.prev_energies = {p[0]: 0.0 for p in PADS}  # reset before first loop
         self.cycleId = self.after(LOOP_MS, self.loop)
 
     def loop(self):
@@ -477,6 +596,20 @@ class HarpApp(tk.Frame):
         res    = wlbt.GetRawImageSlice()
         img    = res[0]
         thresh = self.threshold
+
+        # ── Theta via target tracking ─────────────────────────────────────────
+        # GetSensorTargets() may return 0 targets with narrow theta — graceful fallback.
+        try:
+            for t in wlbt.GetSensorTargets():
+                # t.yPosCm = phi (deg), t.xPosCm = R (cm), t.zPosCm = theta (deg)
+                phi_norm = (t.yPosCm - PHI_MIN) / max(1, PHI_MAX - PHI_MIN)
+                phi_idx  = max(0, min(3, int(phi_norm * 4)))
+                r_idx    = 1 if t.xPosCm > (R_MIN + R_MAX) * 0.5 else 0
+                for p in PADS:
+                    if p[2] == r_idx and p[3] == phi_idx:
+                        self.pad_theta[p[0]] = float(t.zPosCm)
+        except Exception:
+            pass
 
         # ── Compute energies ──────────────────────────────────────────────────
         energies = {}
@@ -491,16 +624,30 @@ class HarpApp(tk.Frame):
 
         now = time.monotonic()
 
+        # ── Hysteresis (Schmitt trigger) ──────────────────────────────────────
+        # Trigger at thresh, release at thresh × RELEASE_THRESHOLD_RATIO.
+        # Prevents flicker when a hand hovers at the detection boundary.
+        release_thresh = thresh * RELEASE_THRESHOLD_RATIO
+        for pid in self.pad_is_active:
+            e = energies[pid]
+            if self.pad_is_active[pid]:
+                if e < release_thresh:
+                    self.pad_is_active[pid] = False
+            else:
+                # Velocity gate: only trigger when energy is rising (positive delta).
+                # Prevents false triggers from a hand drifting slowly into a zone.
+                if e > thresh and e > self.prev_energies[pid]:
+                    self.pad_is_active[pid] = True
+
         # ── 1-HAND vs 2-HAND mode ─────────────────────────────────────────────
-        # 1-HAND: only the single loudest zone triggers NEW notes, but old
-        #         notes from other zones always play out naturally (no _stop).
-        # 2-HAND: any zone above threshold can trigger simultaneously.
-        # In both modes previous notes overlap and decay — no interruption.
         if self.mode == '1-HAND':
             best_pid = max(energies, key=lambda p: energies[p])
-            active   = {best_pid} if energies[best_pid] > thresh else set()
+            active = {best_pid} if self.pad_is_active[best_pid] else set()
+            for pid in list(self.pad_is_active):
+                if pid != best_pid:
+                    self.pad_is_active[pid] = False
         else:
-            active = {pid for pid, e in energies.items() if e > thresh}
+            active = {pid for pid, v in self.pad_is_active.items() if v}
 
         playing      = []
         left_active  = False
@@ -519,7 +666,12 @@ class HarpApp(tk.Frame):
 
             # ── Glow ──────────────────────────────────────────────────────────
             self.pad_countdown[pid] = max(0, self.pad_countdown[pid] - 1)
-            ratio_live  = min(1.0, energy / BAR_MAX)
+            # Two-segment brightness: below thresh → 0-40% (proximity cursor),
+            # above thresh → 40-100% (active play). Hands are always visible.
+            if energy < thresh:
+                ratio_live = energy / thresh * 0.4
+            else:
+                ratio_live = 0.4 + min(0.6, (energy - thresh) / max(1, BAR_MAX - thresh) * 0.6)
             # Decay glow: 100% at trigger → 0% over NOTE_FRAMES (full colour flash)
             ratio_decay = self.pad_countdown[pid] / NOTE_FRAMES
             ratio = max(ratio_live, ratio_decay)
@@ -529,6 +681,10 @@ class HarpApp(tk.Frame):
             # Label glows from dim grey → bright white with pad
             self.canvas.itemconfig(self.label_ids[pid],
                                    fill=_blend('#333333', '#ffffff', ratio))
+            # Debug energy overlay
+            if self.debug_mode:
+                self.canvas.itemconfig(self.energy_ids[pid],
+                                       text=str(int(energy)))
 
             # ── Sustain / retrigger ───────────────────────────────────────────
             if pid in active:
@@ -550,11 +706,48 @@ class HarpApp(tk.Frame):
                 self.pad_countdown[pid] = NOTE_FRAMES
             # elif near_end and not recently_active: note plays out naturally
 
+            # Theta → pitch: continuously update playback rate while note lives.
+            # ±20° theta maps to ±50 cents (factor = 2^(±50/1200)).
+            if _SYSTEM == 'Linux' and self.pad_wavobj[pid] is not None:
+                theta  = self.pad_theta[pid]
+                factor = 2.0 ** (theta * 50.0 / (1200.0 * max(1, abs(THETA_MAX))))
+                _mixer.set_pitch(self.pad_wavobj[pid], factor)
+
         # ── Hand indicator lights ─────────────────────────────────────────────
         self.canvas.itemconfig(self.hand_left_id,
                                fill='#cccccc' if left_active else '#252525')
         self.canvas.itemconfig(self.hand_right_id,
                                fill='#cccccc' if right_active else '#252525')
+
+        # ── MIDI (MPE) ────────────────────────────────────────────────────────
+        if self.midi_enabled and _MIDI_OK:
+            self.midi_throttle = (self.midi_throttle + 1) % 4
+            for pid, label, r_idx, phi_idx, col_idle, col_active, wav, boost in PADS:
+                ch         = _PAD_MIDI_CH[pid]
+                note       = _PAD_MIDI_NOTE[pid]
+                was_on     = self.midi_note_on[pid]
+                now_active = pid in active
+                energy     = energies[pid]
+
+                if now_active and not was_on:
+                    _midi_port.send(_mido.Message('note_on', channel=ch,
+                                                  note=note, velocity=100))
+                    self.midi_note_on[pid] = True
+                elif not now_active and was_on:
+                    _midi_port.send(_mido.Message('note_off', channel=ch,
+                                                  note=note, velocity=0))
+                    self.midi_note_on[pid] = False
+
+                # Continuous expression: pitch bend (theta) + channel pressure (energy)
+                # Throttled to every 4 frames (~80 ms) to avoid MIDI flooding
+                if was_on and self.midi_throttle == 0:
+                    theta    = self.pad_theta[pid]
+                    bend_val = int(theta / max(1, abs(THETA_MAX)) * 2048)
+                    pressure = min(127, max(0, int(energy / BAR_MAX * 200)))
+                    _midi_port.send(_mido.Message('pitchwheel', channel=ch,
+                                                  pitch=bend_val))
+                    _midi_port.send(_mido.Message('aftertouch', channel=ch,
+                                                  value=pressure))
 
         # ── Status bar ────────────────────────────────────────────────────────
         if playing:
@@ -565,6 +758,7 @@ class HarpApp(tk.Frame):
         else:
             self.statusVar.set('Ready \u2014 wave through zones to play  \u00b7  keep moving to sustain')
 
+        self.prev_energies = dict(energies)
         self.cycleId = self.after(LOOP_MS, self.loop)
 
 
@@ -575,11 +769,18 @@ def main():
     root.resizable(False, False)
     app = HarpApp(root)
     app.pack()
+    root.bind('d', app._toggle_debug)
+    root.bind('m', app._toggle_midi)
     root.update_idletasks()
 
     def _on_close():
         if app.cycleId:
             root.after_cancel(app.cycleId)
+        if _MIDI_OK and app.midi_enabled:
+            for pid in app.midi_note_on:
+                if app.midi_note_on[pid]:
+                    _midi_port.send(_mido.Message('note_off', channel=_PAD_MIDI_CH[pid],
+                                                  note=_PAD_MIDI_NOTE[pid], velocity=0))
         try:
             wlbt.Stop()
             wlbt.Disconnect()

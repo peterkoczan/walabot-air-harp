@@ -25,7 +25,7 @@ import math, wave, struct, os
 RATE       = 44100
 DURATION   = 3.0    # seconds — must match NOTE_DURATION logic in walaharp.py
 ATTACK     = 0.008  # 8 ms sharp attack (percussive hit feel)
-PEAK       = 0.30   # peak amplitude; ≤4 simultaneous notes stay below clip in practice
+PEAK       = 0.25   # peak amplitude; lowered from 0.30 to headroom for echo tail
 
 # Exponential decay: fundamental falls to exp(-BASE_DECAY) ≈ 5 % at end of DURATION.
 # Higher harmonics multiply this rate (see HARM_RATES below).
@@ -57,8 +57,11 @@ OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def make_tone(name, freq):
-    n         = int(RATE * DURATION)
-    h_span    = DURATION - ATTACK   # seconds over which exponential runs
+    # Low notes (A3=220 Hz, C4=262 Hz) get a sub-octave harmonic for added depth
+    harmonics    = [(0.5, 0.08, 0.7)] + list(_H) if freq < 280 else _H
+    total_weight = sum(w for _, w, _ in harmonics)
+    n            = int(RATE * DURATION)
+    h_span       = DURATION - ATTACK   # seconds over which exponential runs
 
     frames = []
     for i in range(n):
@@ -70,9 +73,9 @@ def make_tone(name, freq):
 
         # Sum harmonics with per-harmonic exponential decay
         sample = 0.0
-        for mult, weight, decay_mult in _H:
+        for mult, weight, decay_mult in harmonics:
             h_env    = math.exp(-BASE_DECAY * decay_mult * h_t / h_span)
-            h_weight = weight / _TOTAL_WEIGHT
+            h_weight = weight / total_weight
             sample  += math.sin(2 * math.pi * freq * mult * t) * h_weight * h_env
 
         frames.append(int(attack_factor * PEAK * sample * 32767))
