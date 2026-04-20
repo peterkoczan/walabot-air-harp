@@ -124,23 +124,25 @@ else:
     def _stop(wf):    pass
 
 # ── Note / pad definitions ────────────────────────────────────────────────────
-# (id, label, r_idx 0=near/1=far, phi_idx 0=outer-left…3=outer-right,
-#  idle_color, active_color, wav)
+# (id, label, r_idx, phi_idx, idle_color, active_color, wav, boost)
 #
 # Layout — A minor pentatonic, low-left to high-right:
 #   NEAR row:  A3   C4   D4   E4
 #   FAR  row:  G4   A4   C5   E5
 #
+# Outer phi zones (phi_idx 0 and 3) sit at ±60° where the antenna pattern
+# has less gain.  boost compensates so all pads feel equally responsive.
+# FAR_BOOST handles the R^4 depth penalty separately.
 PADS = [
-    ('a3', 'A3', 0, 0, '#18082e', '#8844cc', _wav('a3')),   # deep purple
-    ('c4', 'C4', 0, 1, '#081828', '#2288bb', _wav('c4')),   # deep blue
-    ('d4', 'D4', 0, 2, '#082818', '#22aa66', _wav('d4')),   # deep teal
-    ('e4', 'E4', 0, 3, '#182808', '#88cc22', _wav('e4')),   # deep green
+    ('a3', 'A3', 0, 0, '#18082e', '#8844cc', _wav('a3'), 1.8),  # outer-left  near
+    ('c4', 'C4', 0, 1, '#081828', '#2288bb', _wav('c4'), 1.0),  # inner-left  near
+    ('d4', 'D4', 0, 2, '#082818', '#22aa66', _wav('d4'), 1.0),  # inner-right near
+    ('e4', 'E4', 0, 3, '#182808', '#88cc22', _wav('e4'), 1.8),  # outer-right near
 
-    ('g4', 'G4', 1, 0, '#281800', '#cc7700', _wav('g4')),   # deep amber
-    ('a4', 'A4', 1, 1, '#280018', '#dd3388', _wav('a4')),   # deep rose
-    ('c5', 'C5', 1, 2, '#002828', '#22cccc', _wav('c5')),   # deep cyan
-    ('e5', 'E5', 1, 3, '#1c1800', '#ddcc22', _wav('e5')),   # deep gold
+    ('g4', 'G4', 1, 0, '#281800', '#cc7700', _wav('g4'), 2.5),  # outer-left  far  ← boosted
+    ('a4', 'A4', 1, 1, '#280018', '#dd3388', _wav('a4'), 1.0),  # inner-left  far
+    ('c5', 'C5', 1, 2, '#002828', '#22cccc', _wav('c5'), 1.0),  # inner-right far
+    ('e5', 'E5', 1, 3, '#1c1800', '#ddcc22', _wav('e5'), 2.5),  # outer-right far  ← boosted
 ]
 
 # ── Detection / sustain constants ─────────────────────────────────────────────
@@ -283,7 +285,7 @@ class HarpApp(tk.Frame):
                       text='HIGH', fill='#2a2a2a', font='TkFixedFont 8', anchor=tk.E)
 
         # Pad sectors + labels
-        for pid, label, r_idx, phi_idx, col_idle, col_active, wav in PADS:
+        for pid, label, r_idx, phi_idx, col_idle, col_active, wav, boost in PADS:
             r_in  = 5                      if r_idx == 0 else R_NEAR_PX + DEAD_R_PX
             r_out = R_NEAR_PX - DEAD_R_PX  if r_idx == 0 else R_FAR_PX
             r_lbl = (r_in + r_out) / 2
@@ -374,12 +376,13 @@ class HarpApp(tk.Frame):
 
         playing = []
 
-        for pid, label, r_idx, phi_idx, col_idle, col_active, wav in PADS:
+        for pid, label, r_idx, phi_idx, col_idle, col_active, wav, boost in PADS:
             r_rng   = self.r_ranges[r_idx]
             phi_rng = self.phi_ranges[phi_idx]
             energy  = sum(img[i][j] for i in r_rng for j in phi_rng)
             if r_idx == 1:
                 energy *= FAR_BOOST
+            energy *= boost   # per-pad outer-angle compensation
 
             # ── Glow ──────────────────────────────────────────────────────────
             # Primary glow tracks live energy.
