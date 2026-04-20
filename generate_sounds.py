@@ -13,7 +13,7 @@ RATE     = 44100
 DURATION = 2.5    # seconds — must match NOTE_DURATION in walaharp.py
 ATTACK   = 0.06   # 60 ms linear attack
 RELEASE  = 0.80   # 800 ms release
-PEAK     = 0.50   # peak amplitude — headroom for 3-4 simultaneous notes in mixer
+PEAK     = 0.40   # peak amplitude — 2 notes sum to 0.80, mixer peak-limits the rest
 
 # A minor pentatonic — two octaves, left (low) → right (high)
 NOTES = [

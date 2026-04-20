@@ -77,9 +77,14 @@ class _Mixer:
                     for i, s in enumerate(
                             struct.unpack('<%dh' % (len(data) // 2), data)):
                         out[i] += s
-                buf = struct.pack(
-                    '<%dh' % self.CHUNK,
-                    *[max(-32768, min(32767, s)) for s in out])
+                # Peak limiter: if the mix would clip, scale the whole chunk
+                # down to fit.  This avoids hard-clipping distortion when
+                # multiple notes play simultaneously.
+                peak = max(abs(s) for s in out)
+                if peak > 32767:
+                    scale = 32767.0 / peak
+                    out = [int(s * scale) for s in out]
+                buf = struct.pack('<%dh' % self.CHUNK, *out)
             else:
                 buf = silence
                 time.sleep(self.CHUNK / self.RATE)   # prevent OS pipe pre-fill
