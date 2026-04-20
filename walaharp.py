@@ -7,8 +7,9 @@ Notes are A minor pentatonic; any combination sounds musical.
   Left hand:   A3 (near outer-L) · D4 (near inner-L) · G4 (far inner-L) · C5 (far outer-L)
   Right hand:  C4 (near inner-R) · E4 (near outer-R) · A4 (far inner-R) · E5 (far outer-R)
 
-Notes sustain while your hand stays in a zone, then decay naturally when
-you move away.  Multiple zones can play simultaneously.
+Each wave triggers a percussive pluck that decays naturally (~3 s).
+Keep your hand gently moving in a zone to loop the note seamlessly.
+Multiple zones play simultaneously — any combination is in tune.
 
 Run generate_sounds.py once first to create the WAV files.
 """
@@ -38,14 +39,9 @@ class _Mixer:
     RATE  = 44100
     CHUNK = 256   # ~6 ms per chunk
 
-    # Limiter state: gain is reduced instantly on a peak, then recovers slowly.
-    # RELEASE_COEF: gain recovered per chunk (~0.5 s to go from 0.75→1.0).
-    RELEASE_COEF = 0.015   # ~170 ms recovery (was 0.003 = ~500 ms, too slow/audible)
-
     def __init__(self):
         self._streams = []
         self._lock    = threading.Lock()
-        self._gain    = 1.0   # current output gain (1.0 = unity)
         self._proc    = subprocess.Popen(
             ['aplay', '-q', '-t', 'raw', '-f', 'S16_LE',
              '-r', str(self.RATE), '-c', '1', '-'],
@@ -120,22 +116,15 @@ class _Mixer:
                     for i, s in enumerate(
                             struct.unpack('<%dh' % (len(data) // 2), data)):
                         out[i] += s
-                # Slow-release peak limiter.
-                # Fast attack: if the mix exceeds ±32767 the gain is reduced
-                #   immediately to just fit — no hard clipping.
-                # Slow release: gain recovers by RELEASE_COEF per chunk
-                #   (~0.5 s to go from 0.75 back to 1.0) so there is no
-                #   per-chunk pumping artifact (the cause of the buzz).
+                # Per-chunk peak normalisation: if the mix exceeds ±32767 scale
+                # it down to fit exactly.  No inter-chunk memory → no pumping
+                # artifact when a new note is triggered alongside existing ones.
+                # With PEAK=0.25 in the WAV files, 4 simultaneous notes sum to
+                # exactly 1.0 — normalisation only fires on edge cases (5+ notes).
                 peak = max(abs(s) for s in out)
-                if peak == 0:
-                    peak = 1
-                target = min(1.0, 32767.0 / peak)
-                if target < self._gain:
-                    self._gain = target                          # fast attack
-                else:
-                    self._gain = min(1.0, self._gain + self.RELEASE_COEF)  # slow release
-                if self._gain < 1.0:
-                    out = [int(s * self._gain) for s in out]
+                if peak > 32767:
+                    factor = 32767.0 / peak
+                    out = [int(s * factor) for s in out]
                 buf = struct.pack('<%dh' % self.CHUNK,
                                   *[max(-32768, min(32767, s)) for s in out])
             else:
@@ -204,13 +193,17 @@ BAR_MAX          = 1500  # energy level that maxes out the glow
 # Far zone boost — signal attenuates ~R^4; hands at 90 cm return far less energy
 FAR_BOOST        = 5.0
 
-# Note sustain: each WAV is NOTE_DURATION seconds long.
-# While a hand is present the note retriggered whenever it nears its end,
-# creating a seamless loop.  After the hand leaves the note plays out gracefully.
-NOTE_DURATION    = 2.5          # seconds — must match generate_sounds.py DURATION
-LOOP_MS          = 20           # ms between Walabot frames (~50 fps)
-NOTE_FRAMES      = int(NOTE_DURATION * 1000 / LOOP_MS)   # 125 frames
-RETRIGGER_FRAMES = int(0.12     * 1000 / LOOP_MS)        #   6  frames (safety fallback)
+# Note sustain / retrigger:
+# WAV files are DURATION=3.0 s long (exponential decay — see generate_sounds.py).
+# NOTE_DURATION controls the retrigger window: a note is eligible to loop only if
+# the pad was detected within the last NOTE_DURATION seconds.
+# NOTE_DURATION < WAV DURATION so a single brief wave plays the note ONCE (3 s),
+# then fades — it will NOT loop.  Continuous hand movement keeps pad_last_active
+# fresh → note seamlessly retriggers at the end → sustained note.
+NOTE_DURATION    = 2.5   # seconds — retrigger window (< WAV 3.0 s prevents auto-loop)
+LOOP_MS          = 20    # ms between Walabot frames (~50 fps)
+NOTE_FRAMES      = 150   # visual glow frames  (3.0 s ÷ 20 ms)
+RETRIGGER_FRAMES = 6     # safety fallback (unused when rem_ms path works)
 
 
 # ── Walabot arena ─────────────────────────────────────────────────────────────
@@ -466,7 +459,7 @@ class HarpApp(tk.Frame):
             range(3*q + 1, sY),       # full outer-right (no roll strip)
         ]
 
-        self.statusVar.set('Ready — wave hands above zones to play; keep moving to sustain')
+        self.statusVar.set('Ready — wave hands through zones to play  ·  keep moving to sustain')
         self.cycleId = self.after(LOOP_MS, self.loop)
 
     def loop(self):
@@ -541,7 +534,7 @@ class HarpApp(tk.Frame):
                 self.pad_wavobj[pid] = _play(wav)
                 self.pad_hits[pid]  += 1
                 self.pad_countdown[pid] = NOTE_FRAMES
-            # Note plays out naturally once recently_active expires
+            # elif near_end and not recently_active: note plays out naturally
 
         # ── Hand indicator lights ─────────────────────────────────────────────
         self.canvas.itemconfig(self.hand_left_id,
@@ -556,7 +549,7 @@ class HarpApp(tk.Frame):
             self.statusVar.set('\u266a  {}  \u2014  {}'.format(
                 '   '.join(playing), hands))
         else:
-            self.statusVar.set('Ready \u2014 wave hands above zones  \u00b7  keep moving to sustain')
+            self.statusVar.set('Ready \u2014 wave through zones to play  \u00b7  keep moving to sustain')
 
         self.cycleId = self.after(LOOP_MS, self.loop)
 

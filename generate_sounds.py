@@ -9,11 +9,13 @@ All notes are A minor pentatonic — any combination sounds musical.
 """
 import math, wave, struct, os
 
-RATE     = 44100
-DURATION = 2.5    # seconds — must match NOTE_DURATION in walaharp.py
-ATTACK   = 0.015  # 15 ms linear attack — fast enough to feel instant, no click
-RELEASE  = 0.80   # 800 ms release
-PEAK     = 0.40   # peak amplitude — 2 notes sum to 0.80, mixer peak-limits the rest
+RATE      = 44100
+DURATION  = 3.0    # seconds — WAV length; NOTE_DURATION in walaharp.py controls looping
+ATTACK    = 0.008  # 8 ms sharp linear attack — percussive pluck feel
+PEAK      = 0.30   # peak amplitude; 4 simultaneous notes sum to ≤1.0 in practice
+# Exponential decay: note falls to exp(-DECAY_RATE) ≈ 5% at end of DURATION
+# This gives a natural harp/handpan pluck: loud on hit, fades smoothly over ~1-2 s
+DECAY_RATE = 3.0
 
 # A minor pentatonic — two octaves, left (low) → right (high)
 NOTES = [
@@ -31,20 +33,20 @@ OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def make_tone(name, freq):
-    n = int(RATE * DURATION)
-    sustain_end = DURATION - RELEASE
+    n          = int(RATE * DURATION)
+    decay_span = DURATION - ATTACK   # seconds over which exponential runs
 
     frames = []
     for i in range(n):
         t = i / RATE
 
-        # Envelope
+        # Envelope: sharp attack, then natural exponential decay.
+        # Sounds like a plucked harp string: bright on the hit, decays over ~1-2 s.
         if t < ATTACK:
-            env = t / ATTACK
-        elif t > sustain_end:
-            env = max(0.0, (DURATION - t) / RELEASE)
+            env = t / ATTACK                                          # 0 → 1 ramp
         else:
-            env = 1.0
+            env = math.exp(-DECAY_RATE * (t - ATTACK) / decay_span)  # 1 → ~0.05
+
         env *= PEAK
 
         # Warm harmonic tone: fundamental + 2nd/3rd overtones
@@ -65,12 +67,12 @@ def make_tone(name, freq):
             '<%dh' % n,
             *[max(-32768, min(32767, f)) for f in frames]
         ))
-    print('  {:<5}  {:>7.2f} Hz  ({:.1f}s)  → {}'.format(
+    print('  {:<5}  {:>7.2f} Hz  ({:.1f}s decay)  → {}'.format(
         name, freq, DURATION, os.path.basename(path)))
 
 
 if __name__ == '__main__':
-    print('Generating WalaHarp tones (A minor pentatonic)...')
+    print('Generating WalaHarp tones (A minor pentatonic, exponential decay)...')
     for name, freq in NOTES:
         make_tone(name, freq)
     print('Done.')
