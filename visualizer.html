@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>WalaHarp Visualizer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #080808; color: #aaa; font-family: monospace;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh; padding: 12px;
+  }
+  h1 { font-size: 14px; letter-spacing: 4px; color: #333; margin-bottom: 8px; }
+  #status { font-size: 11px; color: #555; margin-bottom: 10px; min-height: 16px; }
+  canvas { display: block; touch-action: none; }
+  #info { font-size: 10px; color: #444; margin-top: 8px; text-align: center; line-height: 1.6; }
+</style>
+</head>
+<body>
+<h1>W A L A H A R P</h1>
+<div id="status">Connecting…</div>
+<canvas id="c"></canvas>
+<div id="info"></div>
+
+<script>
+const STATUS = document.getElementById('status');
+const INFO   = document.getElementById('info');
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+
+// Responsive canvas size
+const SIZE = Math.min(window.innerWidth - 24, 460);
+canvas.width  = SIZE;
+canvas.height = SIZE;
+const CX = SIZE / 2, CY = SIZE * 0.78;   // sensor at bottom-centre
+const R_MAX = SIZE * 0.72;
+
+// 4 phi sectors × 2 depth zones = 8 pads
+// Sector screen angles (deg from right, CCW), matching the radar fan view
+const SECTORS = [
+  // [id, phi_deg_centre, r_idx, label, colour]
+  ['a3', -110, 0, 'A3', '#8844cc'],
+  ['d4',  -70, 0, 'D4', '#22aa66'],
+  ['c4',   70, 0, 'C4', '#2288bb'],
+  ['e4',  110, 0, 'E4', '#88cc22'],
+  ['g4',  -70, 1, 'G4', '#cc7700'],
+  ['c5', -110, 1, 'C5', '#22cccc'],
+  ['a4',   70, 1, 'A4', '#dd3388'],
+  ['e5',  110, 1, 'E5', '#ddcc22'],
+];
+
+// Map phi angle to screen angle (phi -60→+60 maps to screen 135→45 deg)
+function phiToScreen(phi) {
+  return 180 - phi * 0.75;   // rough mapping; 0° phi = top, ±60° = ±sides
+}
+
+// Zone geometry: two depth bands
+const R_NEAR_IN  = R_MAX * 0.15;
+const R_NEAR_OUT = R_MAX * 0.52;
+const R_FAR_IN   = R_MAX * 0.55;
+const R_FAR_OUT  = R_MAX * 0.92;
+const HALF_ARC   = 18;   // degrees half-width per sector
+
+// Last received state
+let lastState = null;
+
+function hexToRgb(hex) {
+  const r = parseInt(hex.slice(1,3),16);
+  const g = parseInt(hex.slice(3,5),16);
+  const b = parseInt(hex.slice(5,7),16);
+  return [r,g,b];
+}
+
+function drawSector(phi_centre, r_in, r_out, fillColour, label, brightness) {
+  const a1 = (phi_centre - HALF_ARC) * Math.PI / 180;
+  const a2 = (phi_centre + HALF_ARC) * Math.PI / 180;
+
+  ctx.beginPath();
+  ctx.moveTo(CX + r_in  * Math.cos(a1), CY - r_in  * Math.sin(a1));
+  ctx.arc(CX, CY, r_out, -a2, -a1);
+  ctx.arc(CX, CY, r_in,  -a1, -a2, true);
+  ctx.closePath();
+
+  const [r,g,b] = hexToRgb(fillColour);
+  const bg_r = Math.round(r * 0.06), bg_g = Math.round(g * 0.06), bg_b = Math.round(b * 0.06);
+  const fg_r = Math.round(bg_r + (r - bg_r) * brightness);
+  const fg_g = Math.round(bg_g + (g - bg_g) * brightness);
+  const fg_b = Math.round(bg_b + (b - bg_b) * brightness);
+
+  ctx.fillStyle = `rgb(${fg_r},${fg_g},${fg_b})`;
+  ctx.fill();
+  ctx.strokeStyle = '#222';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Label
+  const labelAngle  = phi_centre * Math.PI / 180;
+  const labelR = (r_in + r_out) / 2;
+  const lx = CX + labelR * Math.cos(labelAngle);
+  const ly = CY - labelR * Math.sin(labelAngle);
+  ctx.fillStyle = brightness > 0.3 ? '#fff' : '#444';
+  ctx.font = `bold ${Math.round(SIZE * 0.028)}px monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, lx, ly);
+}
+
+function draw(state) {
+  ctx.clearRect(0, 0, SIZE, SIZE);
+
+  // Background arcs
+  ctx.strokeStyle = '#181818';
+  ctx.lineWidth = 1;
+  for (const r of [R_NEAR_IN, R_NEAR_OUT, R_FAR_OUT]) {
+    ctx.beginPath();
+    ctx.arc(CX, CY, r, Math.PI, 0, true);
+    ctx.stroke();
+  }
+
+  // Radial dividers
+  for (const deg of [-60, -30, 0, 30, 60]) {
+    const a = deg * Math.PI / 180;
+    ctx.beginPath();
+    ctx.moveTo(CX, CY);
+    ctx.lineTo(CX + R_FAR_OUT * Math.cos(a), CY - R_FAR_OUT * Math.sin(a));
+    ctx.stroke();
+  }
+
+  // Draw each sector
+  const zoneMap = {};
+  if (state) {
+    for (const z of state.zones) {
+      zoneMap[z.id] = z;
+    }
+  }
+
+  const THRESH = 200;   // approximate visual threshold
+  const BAR_MAX = 1200;
+
+  for (const [id, phi_centre, r_idx, label, colour] of SECTORS) {
+    const z = zoneMap[id];
+    let brightness = 0;
+    if (z) {
+      const e = z.energy;
+      if (e < THRESH) {
+        brightness = e / THRESH * 0.35;
+      } else {
+        brightness = 0.35 + Math.min(0.65, (e - THRESH) / (BAR_MAX - THRESH) * 0.65);
+      }
+      if (z.active) brightness = Math.max(brightness, 0.7);
+    }
+    const r_in  = r_idx === 0 ? R_NEAR_IN  : R_FAR_IN;
+    const r_out = r_idx === 0 ? R_NEAR_OUT : R_FAR_OUT;
+    drawSector(phi_centre, r_in, r_out, colour, label, brightness);
+  }
+
+  // Sensor dot
+  ctx.beginPath();
+  ctx.arc(CX, CY, 6, 0, 2 * Math.PI);
+  ctx.fillStyle = '#333';
+  ctx.fill();
+}
+
+// WebSocket connection
+const WS_HOST = location.hostname || '192.168.64.2';
+let ws = null;
+let reconnectTimer = null;
+
+function connect() {
+  if (ws && ws.readyState < 2) return;
+  STATUS.textContent = 'Connecting to ws://' + WS_HOST + ':8765 …';
+  ws = new WebSocket('ws://' + WS_HOST + ':8765');
+
+  ws.onopen = () => {
+    STATUS.textContent = 'Connected  ·  ' + WS_HOST + ':8765';
+    clearTimeout(reconnectTimer);
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const state = JSON.parse(e.data);
+      lastState = state;
+      draw(state);
+      const active = state.zones.filter(z => z.active).map(z => z.id).join(' ');
+      INFO.textContent = [
+        'Tuning: ' + (state.tuning || '—'),
+        state.latch ? 'LATCH mode' : 'HOLD mode',
+        active ? '♪ ' + active : '',
+      ].filter(Boolean).join('   ');
+    } catch (_) {}
+  };
+
+  ws.onclose = () => {
+    STATUS.textContent = 'Disconnected — reconnecting…';
+    reconnectTimer = setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => {
+    STATUS.textContent = 'Connection error — retrying…';
+  };
+}
+
+draw(null);  // empty initial frame
+connect();
+</script>
+</body>
+</html>

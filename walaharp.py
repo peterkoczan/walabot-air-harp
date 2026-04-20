@@ -15,12 +15,18 @@ Run generate_sounds.py once first to create the WAV files.
 """
 from __future__ import print_function, division
 import os, math, subprocess, signal, platform, threading, wave, struct, time, collections
+import asyncio, json
 import WalabotAPI as wlbt
 try:
     import numpy as _np
     _NUMPY_OK = True
 except ImportError:
     _NUMPY_OK = False
+try:
+    import websockets as _wslib
+    _WS_OK = True
+except ImportError:
+    _WS_OK = False
 try:
     import tkinter as tk
 except ImportError:
@@ -29,6 +35,68 @@ except ImportError:
 # Reap zombie subprocesses on Linux so audio never blocks
 if hasattr(signal, 'SIGCHLD'):
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+
+# ── WebSocket visualizer server (port 8765) ───────────────────────────────────
+WS_PORT      = 8765
+_ws_clients  = set()
+_ws_lock     = threading.Lock()
+_ws_loop     = None   # asyncio event loop running in background thread
+
+
+async def _ws_handler(websocket):
+    with _ws_lock:
+        _ws_clients.add(websocket)
+    try:
+        async for _ in websocket:
+            pass
+    except Exception:
+        pass
+    finally:
+        with _ws_lock:
+            _ws_clients.discard(websocket)
+
+
+async def _ws_broadcast(msg):
+    with _ws_lock:
+        clients = set(_ws_clients)
+    dead = set()
+    for ws in clients:
+        try:
+            await ws.send(msg)
+        except Exception:
+            dead.add(ws)
+    if dead:
+        with _ws_lock:
+            _ws_clients -= dead
+
+
+async def _ws_serve():
+    async with _wslib.serve(_ws_handler, '0.0.0.0', WS_PORT):
+        await asyncio.Future()   # run forever
+
+
+def _ws_thread_main():
+    global _ws_loop
+    _ws_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_ws_loop)
+    try:
+        _ws_loop.run_until_complete(_ws_serve())
+    except Exception:
+        pass
+
+
+def _ws_start():
+    if not _WS_OK:
+        return
+    threading.Thread(target=_ws_thread_main, daemon=True).start()
+
+
+def _ws_send(payload):
+    """Thread-safe: enqueue a JSON broadcast from any thread."""
+    if not _WS_OK or _ws_loop is None:
+        return
+    asyncio.run_coroutine_threadsafe(_ws_broadcast(payload), _ws_loop)
+
 
 # ── Audio ─────────────────────────────────────────────────────────────────────
 _DIR    = os.path.dirname(os.path.abspath(__file__))
@@ -501,6 +569,9 @@ class HarpApp(tk.Frame):
         self._build_canvas()
         self._build_controls()
 
+        self._ws_throttle = 0   # broadcast every 5 frames (~100 ms)
+        _ws_start()
+
         self.after(200, self._connect_walabot)
 
     # ── Canvas ────────────────────────────────────────────────────────────────
@@ -947,6 +1018,18 @@ class HarpApp(tk.Frame):
             self.statusVar.set('Ready \u2014 wave through zones to play  \u00b7  keep moving to sustain')
 
         self.prev_energies = dict(self.ema_energies)
+
+        # ── WebSocket broadcast (throttled to ~10 fps) ────────────────────────
+        self._ws_throttle = (self._ws_throttle + 1) % 5
+        if _WS_OK and self._ws_throttle == 0:
+            zones = [{'id': pid, 'energy': round(self.ema_energies[pid], 1),
+                      'active': pid in active,
+                      'theta': round(self.pad_theta.get(pid, 0.0), 2)}
+                     for pid, _, _, _, _, _, _, _ in PADS]
+            _ws_send(json.dumps({'zones': zones, 'timestamp': now,
+                                 'tuning': _TUNINGS[self.tuning_id][0],
+                                 'latch': self.latch_mode}))
+
         self.cycleId = self.after(LOOP_MS, self.loop)
 
 
