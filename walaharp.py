@@ -17,6 +17,11 @@ from __future__ import print_function, division
 import os, math, subprocess, signal, platform, threading, wave, struct, time, collections
 import WalabotAPI as wlbt
 try:
+    import numpy as _np
+    _NUMPY_OK = True
+except ImportError:
+    _NUMPY_OK = False
+try:
     import tkinter as tk
 except ImportError:
     import Tkinter as tk
@@ -32,6 +37,73 @@ _SYSTEM = platform.system()
 
 def _wav(name):
     return os.path.join(_DIR, name + '.wav')
+
+
+# ── Karplus-Strong synthesis ──────────────────────────────────────────────────
+KS_MODE = True   # True = real-time KS pluck; False = WAV file fallback
+
+# Base frequencies for each pad ID (A minor pentatonic, two octaves)
+_NOTE_FREQ = {
+    'a3': 220.00, 'c4': 261.63, 'd4': 293.66, 'e4': 329.63,
+    'g4': 392.00, 'a4': 440.00, 'c5': 523.25, 'e5': 659.25,
+}
+
+_KS_CACHE = {}   # {freq: numpy int16 array of PCM samples}
+
+
+def _ks_pluck(freq, rate=44100, duration=3.0, peak=0.25):
+    """Generate a Karplus-Strong plucked-string PCM buffer (numpy int16)."""
+    N   = max(2, round(rate / freq))   # delay line length = one period
+    n   = int(rate * duration)          # total output samples
+    rng = _np.random.default_rng()
+    buf = list(rng.uniform(-1.0, 1.0, N))   # initialise with white noise
+    # Decay per sample tuned so the note fades to ~5 % amplitude in `duration` s.
+    # With lowpass averaging (0.5 × sum) each pass, decay≈0.996 gives a natural
+    # harp pluck that sustains for ~3 s and becomes inaudible by the end.
+    decay = 0.996
+    out = _np.empty(n, dtype=_np.float64)
+    idx = 0
+    for i in range(n):
+        out[i] = buf[idx]
+        ni = (idx + 1) % N
+        buf[idx] = 0.5 * decay * (buf[idx] + buf[ni])
+        idx = ni
+    max_amp = _np.max(_np.abs(out)) or 1.0
+    return (out * (peak / max_amp) * 32767).astype(_np.int16)
+
+
+def _ks_ensure(freq):
+    """Pre-generate and cache KS buffer for freq if not already cached."""
+    if freq not in _KS_CACHE and _NUMPY_OK:
+        _KS_CACHE[freq] = _ks_pluck(freq)
+
+
+class _KSStream:
+    """Plays back a pre-generated Karplus-Strong buffer with pan support."""
+
+    def __init__(self, freq):
+        if freq not in _KS_CACHE:
+            _ks_ensure(freq)
+        self._data  = _KS_CACHE[freq]
+        self._total = len(self._data)
+        self._pos   = 0
+        self.pitch  = 1.0
+        self.pan_l  = 0.707
+        self.pan_r  = 0.707
+
+    def read(self, n_out):
+        pos = self._pos
+        if pos >= self._total:
+            return b'', True
+        end = min(pos + n_out, self._total)
+        chunk = self._data[pos:end]
+        self._pos = end
+        if len(chunk) < n_out:
+            return chunk.tobytes(), True
+        return chunk.tobytes(), False
+
+    def remaining_ms(self, rate):
+        return max(0, self._total - self._pos) / rate * 1000
 
 
 # Shared frame data for each WAV path — loaded once, reused across _WavStream instances
@@ -102,6 +174,18 @@ class _Mixer:
         """Create a _WavStream for path, add to mix, return the stream object."""
         try:
             stream = _WavStream(path)
+            stream.pan_l = pan_l
+            stream.pan_r = pan_r
+            with self._lock:
+                self._streams.append(stream)
+            return stream
+        except Exception:
+            return None
+
+    def play_ks(self, freq, pan_l=0.707, pan_r=0.707):
+        """Create a _KSStream for freq, add to mix, return stream."""
+        try:
+            stream = _KSStream(freq)
             stream.pan_l = pan_l
             stream.pan_r = pan_r
             with self._lock:
@@ -201,12 +285,6 @@ class _Mixer:
                 time.sleep(remaining)
 
 
-if _SYSTEM == 'Linux':
-    _mixer = _Mixer()
-    def _play(path, pan_l=0.707, pan_r=0.707): return _mixer.play(path, pan_l, pan_r)
-    def _stop(wf):                             _mixer.stop(wf)
-    def _remaining_ms(wf):                     return _mixer.remaining_ms(wf)
-
 # ── Optional MIDI output ───────────────────────────────────────────────────────
 # Requires mido + python-rtmidi.  Gracefully disabled if unavailable.
 _MIDI_OK   = False
@@ -226,17 +304,26 @@ _PAD_MIDI_NOTE = {
 _PAD_MIDI_CH = {pid: idx for idx, pid in enumerate(
     ['a3', 'd4', 'g4', 'c5', 'c4', 'e4', 'a4', 'e5'])}  # ch 0-7
 
-if _SYSTEM == 'Darwin':
+# ── Platform audio dispatch ───────────────────────────────────────────────────
+if _SYSTEM == 'Linux':
+    _mixer = _Mixer()
+    def _play(path, pan_l=0.707, pan_r=0.707):    return _mixer.play(path, pan_l, pan_r)
+    def _play_ks(freq, pan_l=0.707, pan_r=0.707): return _mixer.play_ks(freq, pan_l, pan_r)
+    def _stop(wf):                                 _mixer.stop(wf)
+    def _remaining_ms(wf):                         return _mixer.remaining_ms(wf)
+elif _SYSTEM == 'Darwin':
     def _play(path, pan_l=0.707, pan_r=0.707):
         subprocess.Popen(['afplay', path],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return None
-    def _stop(wf):           pass
-    def _remaining_ms(wf):   return 0
+    def _play_ks(freq, pan_l=0.707, pan_r=0.707): return None
+    def _stop(wf):                                 pass
+    def _remaining_ms(wf):                         return 0
 else:
-    def _play(path, pan_l=0.707, pan_r=0.707): return None
-    def _stop(wf):                              pass
-    def _remaining_ms(wf):                      return 0
+    def _play(path, pan_l=0.707, pan_r=0.707):    return None
+    def _play_ks(freq, pan_l=0.707, pan_r=0.707): return None
+    def _stop(wf):                                 pass
+    def _remaining_ms(wf):                         return 0
 
 # ── Note / pad definitions ────────────────────────────────────────────────────
 # Handpan alternating-hand layout (ascending L→R across the scale):
@@ -566,6 +653,12 @@ class HarpApp(tk.Frame):
                                                   note=_PAD_MIDI_NOTE[pid], velocity=0))
                     self.midi_note_on[pid] = False
 
+    def _toggle_ks(self, _event=None):
+        global KS_MODE
+        KS_MODE = not KS_MODE
+        label = 'KS' if KS_MODE else 'WAV'
+        self.statusVar.set('Synthesis: {} mode'.format(label))
+
     def _init_walabot(self):
         wlbt.Init()
         wlbt.SetSettingsFolder()
@@ -594,6 +687,11 @@ class HarpApp(tk.Frame):
 
     def start_scan(self):
         self.statusVar.set('Warming up — keep hands away from sensor...')
+        # Pre-generate KS buffers while warming up (8 notes, ~100 ms each)
+        if KS_MODE and _NUMPY_OK:
+            self.statusVar.set('Warming up — generating KS buffers...')
+            for pid, _, _, _, _, _, _, _ in PADS:
+                _ks_ensure(_NOTE_FREQ[pid])
         # 30 warm-up triggers so MTI builds a stable background reference
         for _ in range(30):
             wlbt.Trigger()
@@ -734,7 +832,10 @@ class HarpApp(tk.Frame):
             recently_active = (now - self.pad_last_active[pid]) < NOTE_DURATION
             if near_end and recently_active:
                 pan_l, pan_r = _phi_pan(phi_idx)
-                self.pad_wavobj[pid] = _play(wav, pan_l, pan_r)
+                if KS_MODE and _NUMPY_OK and pid in _NOTE_FREQ:
+                    self.pad_wavobj[pid] = _play_ks(_NOTE_FREQ[pid], pan_l, pan_r)
+                else:
+                    self.pad_wavobj[pid] = _play(wav, pan_l, pan_r)
                 self.pad_hits[pid]  += 1
                 self.pad_countdown[pid] = NOTE_FRAMES
             # elif near_end and not recently_active: note plays out naturally
@@ -804,6 +905,7 @@ def main():
     app.pack()
     root.bind('d', app._toggle_debug)
     root.bind('m', app._toggle_midi)
+    root.bind('k', app._toggle_ks)
     root.update_idletasks()
 
     def _on_close():
