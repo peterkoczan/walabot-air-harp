@@ -50,6 +50,8 @@ class _WavStream:
         self._total  = len(self._frames)
         self._pos    = 0.0
         self.pitch   = 1.0   # >1 = faster/higher, <1 = slower/lower
+        self.pan_l   = 0.707  # constant-power pan; default = centre
+        self.pan_r   = 0.707
 
     def read(self, n_out):
         """Return (data_bytes, exhausted).  Interpolates at fractional positions."""
@@ -84,27 +86,38 @@ class _Mixer:
     def __init__(self):
         self._streams  = []
         self._lock     = threading.Lock()
-        # Pre-fill echo buffer with silence so the first 320 ms plays clean
+        # Echo buffer stores stereo interleaved samples (2×CHUNK per entry)
         self._echo_buf = collections.deque(
-            ([0] * self.CHUNK for _ in range(self.ECHO_DELAY_CHUNKS)),
+            ([0] * (self.CHUNK * 2) for _ in range(self.ECHO_DELAY_CHUNKS)),
             maxlen=self.ECHO_DELAY_CHUNKS)
         self._proc    = subprocess.Popen(
             ['aplay', '-q', '-t', 'raw', '-f', 'S16_LE',
-             '-r', str(self.RATE), '-c', '1', '-'],
+             '-r', str(self.RATE), '-c', '2', '-'],
             stdin=subprocess.PIPE,
             bufsize=0,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         threading.Thread(target=self._run, daemon=True).start()
 
-    def play(self, path):
+    def play(self, path, pan_l=0.707, pan_r=0.707):
         """Create a _WavStream for path, add to mix, return the stream object."""
         try:
             stream = _WavStream(path)
+            stream.pan_l = pan_l
+            stream.pan_r = pan_r
             with self._lock:
                 self._streams.append(stream)
             return stream
         except Exception:
             return None
+
+    def set_pan(self, stream, pan_l, pan_r):
+        """Update stereo pan for a live stream (thread-safe)."""
+        if stream is None:
+            return
+        with self._lock:
+            if stream in self._streams:
+                stream.pan_l = pan_l
+                stream.pan_r = pan_r
 
     def stop(self, stream):
         """Remove a stream from the mix immediately (safe if already finished)."""
@@ -135,45 +148,45 @@ class _Mixer:
                 stream.pitch = max(0.5, min(2.0, factor))
 
     def _run(self):
-        """Real-time paced loop: keeps the OS pipe near-empty so audio plays
-        within ~10 ms of a hit instead of waiting for buffered silence to drain."""
-        silence  = b'\x00' * self.CHUNK * 2
+        """Real-time paced stereo loop."""
+        silence  = b'\x00' * self.CHUNK * 4   # CHUNK stereo S16_LE pairs
         interval = self.CHUNK / self.RATE
         while True:
             t0 = time.monotonic()
 
             with self._lock:
-                alive, chunks = [], []
+                alive, items = [], []
                 for stream in self._streams:
                     data, done = stream.read(self.CHUNK)
                     if data:
-                        chunks.append(data)
+                        items.append((data, stream.pan_l, stream.pan_r))
                     if not done:
                         alive.append(stream)
                 self._streams = alive
 
-            # Mix all active streams
-            out = [0] * self.CHUNK
-            for data in chunks:
+            # Mix streams into separate L/R accumulators
+            out_l = [0] * self.CHUNK
+            out_r = [0] * self.CHUNK
+            for data, pan_l, pan_r in items:
                 for i, s in enumerate(
                         struct.unpack('<%dh' % (len(data) // 2), data)):
-                    out[i] += s
+                    out_l[i] += int(s * pan_l)
+                    out_r[i] += int(s * pan_r)
 
-            # Echo / reverb tail: blend in a ~320 ms delayed copy.
-            # Dry signal stored BEFORE adding echo — single-tap delay, no buildup.
-            echo_frame = self._echo_buf[0]
-            self._echo_buf.append(list(out))
-            for i in range(self.CHUNK):
-                out[i] += int(echo_frame[i] * self.ECHO_GAIN)
+            # Interleave L/R, then apply echo on stereo output
+            interleaved = [x for pair in zip(out_l, out_r) for x in pair]
+            echo_frame  = self._echo_buf[0]
+            self._echo_buf.append(list(interleaved))
+            for i in range(self.CHUNK * 2):
+                interleaved[i] += int(echo_frame[i] * self.ECHO_GAIN)
 
-            if any(out):
-                # Per-chunk peak normalisation: no inter-chunk memory → no pumping.
-                peak = max(abs(s) for s in out)
+            if any(interleaved):
+                peak = max(abs(s) for s in interleaved)
                 if peak > 32767:
                     factor = 32767.0 / peak
-                    out = [int(s * factor) for s in out]
-                buf = struct.pack('<%dh' % self.CHUNK,
-                                  *[max(-32768, min(32767, s)) for s in out])
+                    interleaved = [int(s * factor) for s in interleaved]
+                buf = struct.pack('<%dh' % (self.CHUNK * 2),
+                                  *[max(-32768, min(32767, s)) for s in interleaved])
             else:
                 buf = silence
 
@@ -190,9 +203,9 @@ class _Mixer:
 
 if _SYSTEM == 'Linux':
     _mixer = _Mixer()
-    def _play(path):         return _mixer.play(path)
-    def _stop(wf):           _mixer.stop(wf)
-    def _remaining_ms(wf):   return _mixer.remaining_ms(wf)
+    def _play(path, pan_l=0.707, pan_r=0.707): return _mixer.play(path, pan_l, pan_r)
+    def _stop(wf):                             _mixer.stop(wf)
+    def _remaining_ms(wf):                     return _mixer.remaining_ms(wf)
 
 # ── Optional MIDI output ───────────────────────────────────────────────────────
 # Requires mido + python-rtmidi.  Gracefully disabled if unavailable.
@@ -214,16 +227,16 @@ _PAD_MIDI_CH = {pid: idx for idx, pid in enumerate(
     ['a3', 'd4', 'g4', 'c5', 'c4', 'e4', 'a4', 'e5'])}  # ch 0-7
 
 if _SYSTEM == 'Darwin':
-    def _play(path):
+    def _play(path, pan_l=0.707, pan_r=0.707):
         subprocess.Popen(['afplay', path],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return None
     def _stop(wf):           pass
     def _remaining_ms(wf):   return 0
 else:
-    def _play(path):         return None
-    def _stop(wf):           pass
-    def _remaining_ms(wf):   return 0
+    def _play(path, pan_l=0.707, pan_r=0.707): return None
+    def _stop(wf):                              pass
+    def _remaining_ms(wf):                      return 0
 
 # ── Note / pad definitions ────────────────────────────────────────────────────
 # Handpan alternating-hand layout (ascending L→R across the scale):
@@ -249,6 +262,17 @@ PADS = [
     ('a4', 'A4', 1, 2, '#280018', '#dd3388', _wav('a4'), 1.0),  # inner-right far
     ('e5', 'E5', 1, 3, '#1c1800', '#ddcc22', _wav('e5'), 2.5),  # outer-right far
 ]
+
+# ── Stereo pan: constant-power L/R gains per phi zone ────────────────────────
+# Angles in [0°,90°] where 0°=full-left, 90°=full-right.
+# outer-left→18°, inner-left→36°, inner-right→54°, outer-right→72°
+_PHI_PAN_DEG = [18.0, 36.0, 54.0, 72.0]
+
+
+def _phi_pan(phi_idx):
+    a = math.radians(_PHI_PAN_DEG[phi_idx])
+    return math.cos(a), math.sin(a)   # (pan_l, pan_r)
+
 
 # ── Detection / sustain constants ─────────────────────────────────────────────
 ENERGY_THRESHOLD        = 200   # adjustable via slider (lower = more sensitive)
@@ -709,7 +733,8 @@ class HarpApp(tk.Frame):
             near_end        = rem_ms < 50
             recently_active = (now - self.pad_last_active[pid]) < NOTE_DURATION
             if near_end and recently_active:
-                self.pad_wavobj[pid] = _play(wav)
+                pan_l, pan_r = _phi_pan(phi_idx)
+                self.pad_wavobj[pid] = _play(wav, pan_l, pan_r)
                 self.pad_hits[pid]  += 1
                 self.pad_countdown[pid] = NOTE_FRAMES
             # elif near_end and not recently_active: note plays out naturally
