@@ -40,7 +40,7 @@ class _Mixer:
 
     # Limiter state: gain is reduced instantly on a peak, then recovers slowly.
     # RELEASE_COEF: gain recovered per chunk (~0.5 s to go from 0.75→1.0).
-    RELEASE_COEF = 0.003
+    RELEASE_COEF = 0.015   # ~170 ms recovery (was 0.003 = ~500 ms, too slow/audible)
 
     def __init__(self):
         self._streams = []
@@ -81,9 +81,13 @@ class _Mixer:
         """Real-time paced loop: keeps the OS pipe near-empty so audio plays
         within ~10 ms of a hit instead of waiting for buffered silence to drain."""
         silence  = b'\x00' * self.CHUNK * 2
-        # Target slightly under one chunk duration (85%) so we stay just ahead
-        # of aplay without ever pre-filling more than ~1 chunk of pipe buffer.
-        interval = self.CHUNK / self.RATE * 0.85
+        # Write at exactly real-time pace (1 chunk per chunk-duration).
+        # This keeps the OS pipe near-empty so new notes start playing within
+        # ~1 chunk (~6 ms) rather than waiting for a backlog to drain.
+        # It also ensures each 2.5-second WAV is consumed in exactly 2.5 s,
+        # matching the scan-loop countdown — prevents the wav running out
+        # ~260 ms early (which caused notes to go silent mid-sustain).
+        interval = self.CHUNK / self.RATE
         while True:
             t0 = time.monotonic()
 
@@ -306,15 +310,22 @@ class HarpApp(tk.Frame):
                       text='W A L A H A R P',
                       fill='#303030', font='TkFixedFont 9 bold', anchor=tk.CENTER)
 
-        # Hand placement guides
-        c.create_text(DCX - DRX + 12, DCY,
-                      text='LEFT\nHAND',
-                      fill='#1e1e1e', font='TkFixedFont 7',
-                      anchor=tk.W, justify=tk.CENTER)
-        c.create_text(DCX + DRX - 12, DCY,
-                      text='RIGHT\nHAND',
-                      fill='#1e1e1e', font='TkFixedFont 7',
-                      anchor=tk.E, justify=tk.CENTER)
+        # ── Hand indicator lights (update dynamically in loop()) ──────────────
+        # Left hand — glows white when left side has energy
+        lhx, lhy = DCX - DRX + 22, DCY
+        c.create_oval(lhx - 14, lhy - 22, lhx + 14, lhy + 22,
+                      fill='#0f0f0f', outline='#2a2a2a', width=1)
+        self.hand_left_id = c.create_text(
+            lhx, lhy, text='LEFT\nHAND', fill='#252525',
+            font='TkFixedFont 7 bold', anchor=tk.CENTER, justify=tk.CENTER)
+
+        # Right hand
+        rhx, rhy = DCX + DRX - 22, DCY
+        c.create_oval(rhx - 14, rhy - 22, rhx + 14, rhy + 22,
+                      fill='#0f0f0f', outline='#2a2a2a', width=1)
+        self.hand_right_id = c.create_text(
+            rhx, rhy, text='RIGHT\nHAND', fill='#252525',
+            font='TkFixedFont 7 bold', anchor=tk.CENTER, justify=tk.CENTER)
 
         # Depth labels (near / far)
         c.create_text(DCX, DCY - _R_NEAR + 6,
@@ -419,7 +430,9 @@ class HarpApp(tk.Frame):
         img    = res[0]
         thresh = self.threshold
 
-        playing = []
+        playing     = []
+        left_active = False   # any left-side (phi_idx 0 or 1) pad above threshold
+        right_active= False   # any right-side (phi_idx 2 or 3) pad above threshold
 
         for pid, label, r_idx, phi_idx, col_idle, col_active, wav, boost in PADS:
             r_rng   = self.r_ranges[r_idx]
@@ -444,6 +457,10 @@ class HarpApp(tk.Frame):
             # ── Sustain / retrigger ───────────────────────────────────────────
             if energy > thresh:
                 playing.append(label)
+                if phi_idx <= 1:
+                    left_active  = True
+                else:
+                    right_active = True
                 if self.pad_countdown[pid] <= RETRIGGER_FRAMES:
                     # Stop old instance first — prevents two copies of the same
                     # frequency running simultaneously (phase-overlap distortion)
@@ -454,11 +471,20 @@ class HarpApp(tk.Frame):
             # If energy gone: note plays out its remaining countdown naturally
             # (pad_wavobj is left alone — the wave drains to silence by itself)
 
-        # Status bar shows currently sounding notes
+        # ── Hand indicator lights ─────────────────────────────────────────────
+        self.canvas.itemconfig(self.hand_left_id,
+                               fill='#cccccc' if left_active else '#252525')
+        self.canvas.itemconfig(self.hand_right_id,
+                               fill='#cccccc' if right_active else '#252525')
+
+        # ── Status bar ────────────────────────────────────────────────────────
         if playing:
-            self.statusVar.set('\u266a  ' + '   '.join(playing))
+            hands = ('TWO HANDS' if left_active and right_active
+                     else 'LEFT HAND' if left_active else 'RIGHT HAND')
+            self.statusVar.set('\u266a  {}  \u2014  {}'.format(
+                '   '.join(playing), hands))
         else:
-            self.statusVar.set('Ready \u2014 wave hands above the sensor')
+            self.statusVar.set('Ready \u2014 place both hands above the sensor')
 
         self.cycleId = self.after(LOOP_MS, self.loop)
 
