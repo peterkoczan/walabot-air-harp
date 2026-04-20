@@ -198,7 +198,7 @@ PADS = [
 ]
 
 # ── Detection / sustain constants ─────────────────────────────────────────────
-ENERGY_THRESHOLD = 300   # adjustable via slider
+ENERGY_THRESHOLD = 500   # adjustable via slider — higher default without MTI
 BAR_MAX          = 1500  # energy level that maxes out the glow
 
 # Far zone boost — signal attenuates ~R^4; hands at 90 cm return far less energy
@@ -440,7 +440,11 @@ class HarpApp(tk.Frame):
         wlbt.SetArenaR(R_MIN, R_MAX, R_RES)
         wlbt.SetArenaPhi(PHI_MIN, PHI_MAX, PHI_RES)
         wlbt.SetArenaTheta(THETA_MIN, THETA_MAX, THETA_RES)
-        wlbt.SetDynamicImageFilter(wlbt.FILTER_TYPE_MTI)
+        # FILTER_TYPE_NONE: raw signal after calibration baseline.
+        # MTI (derivative filter) only sees MOVING targets; a held hand fades
+        # to zero after 2-3 frames — exactly why sustained notes kept cutting out.
+        # With no filter, a held hand produces continuous energy above threshold.
+        wlbt.SetDynamicImageFilter(wlbt.FILTER_TYPE_NONE)
         wlbt.SetThreshold(35)
         wlbt.Start()
 
