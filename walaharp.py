@@ -39,9 +39,14 @@ class _Mixer:
     RATE  = 44100
     CHUNK = 256   # ~6 ms per chunk
 
+    # Limiter state: gain is reduced instantly on a peak, then recovers slowly.
+    # RELEASE_COEF: gain recovered per chunk (~0.5 s to go from 0.75→1.0).
+    RELEASE_COEF = 0.003
+
     def __init__(self):
         self._streams = []
         self._lock    = threading.Lock()
+        self._gain    = 1.0   # current output gain (1.0 = unity)
         self._proc    = subprocess.Popen(
             ['aplay', '-q', '-t', 'raw', '-f', 'S16_LE',
              '-r', str(self.RATE), '-c', '1', '-'],
@@ -92,14 +97,24 @@ class _Mixer:
                     for i, s in enumerate(
                             struct.unpack('<%dh' % (len(data) // 2), data)):
                         out[i] += s
-                # Peak limiter: if the mix would clip, scale the whole chunk
-                # down to fit.  This avoids hard-clipping distortion when
-                # multiple notes play simultaneously.
+                # Slow-release peak limiter.
+                # Fast attack: if the mix exceeds ±32767 the gain is reduced
+                #   immediately to just fit — no hard clipping.
+                # Slow release: gain recovers by RELEASE_COEF per chunk
+                #   (~0.5 s to go from 0.75 back to 1.0) so there is no
+                #   per-chunk pumping artifact (the cause of the buzz).
                 peak = max(abs(s) for s in out)
-                if peak > 32767:
-                    scale = 32767.0 / peak
-                    out = [int(s * scale) for s in out]
-                buf = struct.pack('<%dh' % self.CHUNK, *out)
+                if peak == 0:
+                    peak = 1
+                target = min(1.0, 32767.0 / peak)
+                if target < self._gain:
+                    self._gain = target                          # fast attack
+                else:
+                    self._gain = min(1.0, self._gain + self.RELEASE_COEF)  # slow release
+                if self._gain < 1.0:
+                    out = [int(s * self._gain) for s in out]
+                buf = struct.pack('<%dh' % self.CHUNK,
+                                  *[max(-32768, min(32767, s)) for s in out])
             else:
                 buf = silence
                 time.sleep(self.CHUNK / self.RATE)   # prevent OS pipe pre-fill
