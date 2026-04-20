@@ -1,12 +1,11 @@
 """
 walaharp.py — Walabot air harp: wave hands above the sensor to play harmonic tones.
 
-4 azimuth zones × 2 depth zones = 8 pads.
-All notes are A minor pentatonic — any combination sounds musical.
+Handpan layout — 8 oval tone fields on a circular drum body.
+Notes are A minor pentatonic; any combination sounds musical.
 
-    FAR   (hands high)  G4  A4  C5  E5
-    NEAR  (hands low)   A3  C4  D4  E4
-                     left ←      → right
+  Left hand:   A3 (near outer-L) · D4 (near inner-L) · G4 (far inner-L) · C5 (far outer-L)
+  Right hand:  C4 (near inner-R) · E4 (near outer-R) · A4 (far inner-R) · E5 (far outer-R)
 
 Notes sustain while your hand stays in a zone, then decay naturally when
 you move away.  Multiple zones can play simultaneously.
@@ -79,8 +78,15 @@ class _Mixer:
                 pass   # already finished naturally — no-op
 
     def _run(self):
-        silence = b'\x00' * self.CHUNK * 2
+        """Real-time paced loop: keeps the OS pipe near-empty so audio plays
+        within ~10 ms of a hit instead of waiting for buffered silence to drain."""
+        silence  = b'\x00' * self.CHUNK * 2
+        # Target slightly under one chunk duration (85%) so we stay just ahead
+        # of aplay without ever pre-filling more than ~1 chunk of pipe buffer.
+        interval = self.CHUNK / self.RATE * 0.85
         while True:
+            t0 = time.monotonic()
+
             with self._lock:
                 alive, chunks = [], []
                 for wf in self._streams:
@@ -91,6 +97,7 @@ class _Mixer:
                     else:
                         wf.close()
                 self._streams = alive
+
             if chunks:
                 out = [0] * self.CHUNK
                 for data in chunks:
@@ -117,11 +124,19 @@ class _Mixer:
                                   *[max(-32768, min(32767, s)) for s in out])
             else:
                 buf = silence
-                time.sleep(self.CHUNK / self.RATE)   # prevent OS pipe pre-fill
+
             try:
                 self._proc.stdin.write(buf)
             except (BrokenPipeError, OSError):
                 break
+
+            # Pace the loop: sleep for the remaining fraction of a chunk period.
+            # This keeps the OS pipe almost empty so the next note plays
+            # immediately without draining a backlog of buffered silence.
+            elapsed   = time.monotonic() - t0
+            remaining = interval - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
 
 
 if _SYSTEM == 'Linux':
@@ -139,25 +154,28 @@ else:
     def _stop(wf):    pass
 
 # ── Note / pad definitions ────────────────────────────────────────────────────
-# (id, label, r_idx, phi_idx, idle_color, active_color, wav, boost)
+# Handpan alternating-hand layout (ascending L→R across the scale):
 #
-# Layout — A minor pentatonic, low-left to high-right:
-#   NEAR row:  A3   C4   D4   E4
-#   FAR  row:  G4   A4   C5   E5
+#   LEFT  hand: A3 (outer-L near) · D4 (inner-L near) · G4 (inner-L far) · C5 (outer-L far)
+#   RIGHT hand: C4 (inner-R near) · E4 (outer-R near) · A4 (inner-R far) · E5 (outer-R far)
 #
 # Outer phi zones (phi_idx 0 and 3) sit at ±60° where the antenna pattern
 # has less gain.  boost compensates so all pads feel equally responsive.
 # FAR_BOOST handles the R^4 depth penalty separately.
+#
+# (id, label, r_idx, phi_idx, idle_color, active_color, wav, boost)
 PADS = [
+    # Left hand — ascending near→far: A3 · D4 · G4 · C5
     ('a3', 'A3', 0, 0, '#18082e', '#8844cc', _wav('a3'), 1.8),  # outer-left  near
-    ('c4', 'C4', 0, 1, '#081828', '#2288bb', _wav('c4'), 1.0),  # inner-left  near
-    ('d4', 'D4', 0, 2, '#082818', '#22aa66', _wav('d4'), 1.0),  # inner-right near
-    ('e4', 'E4', 0, 3, '#182808', '#88cc22', _wav('e4'), 1.8),  # outer-right near
+    ('d4', 'D4', 0, 1, '#082818', '#22aa66', _wav('d4'), 1.0),  # inner-left  near
+    ('g4', 'G4', 1, 1, '#281800', '#cc7700', _wav('g4'), 1.0),  # inner-left  far  (moved from outer — fixes over-boost)
+    ('c5', 'C5', 1, 0, '#002828', '#22cccc', _wav('c5'), 1.8),  # outer-left  far
 
-    ('g4', 'G4', 1, 0, '#281800', '#cc7700', _wav('g4'), 1.5),  # outer-left  far
-    ('a4', 'A4', 1, 1, '#280018', '#dd3388', _wav('a4'), 1.0),  # inner-left  far
-    ('c5', 'C5', 1, 2, '#002828', '#22cccc', _wav('c5'), 1.0),  # inner-right far
-    ('e5', 'E5', 1, 3, '#1c1800', '#ddcc22', _wav('e5'), 2.5),  # outer-right far  ← boosted
+    # Right hand — ascending near→far: C4 · E4 · A4 · E5
+    ('c4', 'C4', 0, 2, '#081828', '#2288bb', _wav('c4'), 1.0),  # inner-right near
+    ('e4', 'E4', 0, 3, '#182808', '#88cc22', _wav('e4'), 1.8),  # outer-right near
+    ('a4', 'A4', 1, 2, '#280018', '#dd3388', _wav('a4'), 1.0),  # inner-right far
+    ('e5', 'E5', 1, 3, '#1c1800', '#ddcc22', _wav('e5'), 2.5),  # outer-right far
 ]
 
 # ── Detection / sustain constants ─────────────────────────────────────────────
@@ -184,36 +202,40 @@ PHI_MIN, PHI_MAX, PHI_RES       = -60, 60, 3
 THETA_MIN, THETA_MAX, THETA_RES = -1, 1, 1
 
 # ── Canvas geometry ───────────────────────────────────────────────────────────
-CW, CH    = 700, 470
-SX, SY    = CW // 2, 440    # sensor at bottom-centre
-R_NEAR_PX = 155
-R_FAR_PX  = 320
-DEAD_R_PX    = 20
-DEAD_PHI_DEG =  4
+CW, CH = 700, 470
 
-# Full-width outer-right zone (no roll strip in this app)
-PHI_SECTORS = [
-    (120 + DEAD_PHI_DEG, 150),
-    ( 90 + DEAD_PHI_DEG, 120 - DEAD_PHI_DEG),
-    ( 60 + DEAD_PHI_DEG,  90 - DEAD_PHI_DEG),
-    ( 30 + DEAD_PHI_DEG,  60 - DEAD_PHI_DEG),
-]
+# Drum body centre and semi-axes
+DCX, DCY = CW // 2, CH // 2 - 15   # 350, 220
+DRX, DRY = 290, 185
+
+# Oval tone-field radii and sizes
+# Two concentric rings: near (inner) and far (outer)
+_R_NEAR = 105   # px from drum centre to near-ring oval centre
+_R_FAR  = 188   # px from drum centre to far-ring oval centre
+_NRX, _NRY = 34, 21   # near oval semi-axes
+_FRX, _FRY = 43, 26   # far  oval semi-axes
+
+# Angle (deg, standard math: 0°=right, +ve counterclockwise) for each note
+# Near ring: 4 ovals at ±60° / ±120°
+# Far ring:  4 ovals at ±30° / ±150°  (interleaved with near ring)
+_OVAL_ANGLE = {
+    'a3': 240,   # near outer-left  (bottom-left)
+    'd4': 120,   # near inner-left  (top-left)
+    'c4':  60,   # near inner-right (top-right)
+    'e4': 300,   # near outer-right (bottom-right)
+    'g4': 150,   # far  inner-left  (upper-left outer)
+    'c5': 210,   # far  outer-left  (lower-left outer)
+    'a4':  30,   # far  inner-right (upper-right outer)
+    'e5': 330,   # far  outer-right (lower-right outer)
+}
 
 
-def _sector_poly(cx, cy, r_in, r_out, a0, a1, steps=20):
-    pts = []
-    for k in range(steps + 1):
-        a = math.radians(a0 + k * (a1 - a0) / steps)
-        pts += [cx + r_out * math.cos(a), cy - r_out * math.sin(a)]
-    for k in range(steps + 1):
-        a = math.radians(a1 - k * (a1 - a0) / steps)
-        pts += [cx + r_in * math.cos(a), cy - r_in * math.sin(a)]
-    return pts
-
-
-def _label_pos(cx, cy, r, a0, a1):
-    a = math.radians((a0 + a1) / 2)
-    return cx + r * math.cos(a), cy - r * math.sin(a)
+def _oval_centre(pid, r_idx):
+    """Return screen (x, y) for the centre of a tone-field oval."""
+    r   = _R_FAR if r_idx == 1 else _R_NEAR
+    ang = math.radians(_OVAL_ANGLE[pid])
+    return (int(DCX + r * math.cos(ang)),
+            int(DCY - r * math.sin(ang)))
 
 
 def _blend(c1, c2, t):
@@ -265,54 +287,62 @@ class HarpApp(tk.Frame):
         self.poly_ids  = {}
         self.label_ids = {}
 
+        # ── Drum body ──────────────────────────────────────────────────────────
+        # Outer glow ring
+        c.create_oval(DCX - DRX - 8, DCY - DRY - 8,
+                      DCX + DRX + 8, DCY + DRY + 8,
+                      fill='#080808', outline='#1a1a1a', width=4)
+        # Main drum shell
+        c.create_oval(DCX - DRX, DCY - DRY,
+                      DCX + DRX, DCY + DRY,
+                      fill='#0c0c0c', outline='#2e2e2e', width=2)
+        # Inner decorative ring (simulates the central "ding" area of a handpan)
+        c.create_oval(DCX - 58, DCY - 40,
+                      DCX + 58, DCY + 40,
+                      fill='#101010', outline='#1e1e1e', width=1)
+
         # Title
-        c.create_text(SX, 16, text='W A L A H A R P',
-                      fill='#444444', font='TkFixedFont 11 bold', anchor=tk.CENTER)
+        c.create_text(DCX, DCY + DRY + 22,
+                      text='W A L A H A R P',
+                      fill='#303030', font='TkFixedFont 9 bold', anchor=tk.CENTER)
 
-        # Guide arcs and zone dividers
-        for r in (R_NEAR_PX, R_FAR_PX):
-            c.create_arc(SX - r, SY - r, SX + r, SY + r,
-                         start=30, extent=120,
-                         outline='#1e1e1e', style=tk.ARC, width=1)
-        for a_deg in (30, 60, 90, 120, 150):
-            a = math.radians(a_deg)
-            c.create_line(SX, SY,
-                          SX + R_FAR_PX * math.cos(a),
-                          SY - R_FAR_PX * math.sin(a),
-                          fill='#1e1e1e', width=1)
+        # Hand placement guides
+        c.create_text(DCX - DRX + 12, DCY,
+                      text='LEFT\nHAND',
+                      fill='#1e1e1e', font='TkFixedFont 7',
+                      anchor=tk.W, justify=tk.CENTER)
+        c.create_text(DCX + DRX - 12, DCY,
+                      text='RIGHT\nHAND',
+                      fill='#1e1e1e', font='TkFixedFont 7',
+                      anchor=tk.E, justify=tk.CENTER)
 
-        # Sensor dot
-        c.create_oval(SX - 5, SY - 5, SX + 5, SY + 5, fill='#222', outline='#444')
-        c.create_text(SX, SY + 14, text='SENSOR', fill='#333', font='TkFixedFont 7')
+        # Depth labels (near / far)
+        c.create_text(DCX, DCY - _R_NEAR + 6,
+                      text='· near ·', fill='#1a1a1a',
+                      font='TkFixedFont 7', anchor=tk.CENTER)
+        c.create_text(DCX, DCY - _R_FAR + 8,
+                      text='· far ·', fill='#1a1a1a',
+                      font='TkFixedFont 7', anchor=tk.CENTER)
 
-        # Depth labels
-        c.create_text(SX - R_FAR_PX - 8,
-                      SY - (R_NEAR_PX + R_FAR_PX) / 2,
-                      text='FULL HAND', fill='#333', font='TkFixedFont 7', anchor=tk.E)
-        c.create_text(SX - R_FAR_PX - 8,
-                      SY - R_NEAR_PX * 0.55,
-                      text='2 FINGERS', fill='#333', font='TkFixedFont 7', anchor=tk.E)
-
-        # Directional pitch hint
-        c.create_text(SX - R_FAR_PX + 10, SY - R_FAR_PX + 10,
-                      text='LOW', fill='#2a2a2a', font='TkFixedFont 8', anchor=tk.W)
-        c.create_text(SX + R_FAR_PX - 10, SY - R_FAR_PX + 10,
-                      text='HIGH', fill='#2a2a2a', font='TkFixedFont 8', anchor=tk.E)
-
-        # Pad sectors + labels
+        # ── Oval tone fields ───────────────────────────────────────────────────
         for pid, label, r_idx, phi_idx, col_idle, col_active, wav, boost in PADS:
-            r_in  = 5                      if r_idx == 0 else R_NEAR_PX + DEAD_R_PX
-            r_out = R_NEAR_PX - DEAD_R_PX  if r_idx == 0 else R_FAR_PX
-            r_lbl = (r_in + r_out) / 2
-            a0, a1 = PHI_SECTORS[phi_idx]
+            cx, cy = _oval_centre(pid, r_idx)
+            rx = _FRX if r_idx == 1 else _NRX
+            ry = _FRY if r_idx == 1 else _NRY
 
-            pts = _sector_poly(SX, SY, r_in, r_out, a0, a1)
-            poly_id = c.create_polygon(*pts, fill=col_idle, outline='#2a2a2a', width=1)
-            self.poly_ids[pid] = (poly_id, col_idle, col_active)
+            # Rim: slightly larger oval gives a raised-dome look
+            c.create_oval(cx - rx - 3, cy - ry - 3,
+                          cx + rx + 3, cy + ry + 3,
+                          fill='#151515', outline='#2a2a2a', width=1)
+            # Main tone field — fill updated each frame by loop()
+            oval_id = c.create_oval(cx - rx, cy - ry,
+                                    cx + rx, cy + ry,
+                                    fill=col_idle, outline='#484848', width=1)
+            self.poly_ids[pid] = (oval_id, col_idle, col_active)
 
-            lx, ly = _label_pos(SX, SY, r_lbl, a0, a1)
+            # Note label
             self.label_ids[pid] = c.create_text(
-                lx, ly, text=label, fill='#aaaaaa',
+                cx, cy, text=label, fill='#aaaaaa',
                 font='TkFixedFont 10 bold', anchor=tk.CENTER)
 
     def _build_controls(self):
