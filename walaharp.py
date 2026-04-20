@@ -293,8 +293,7 @@ class HarpApp(tk.Frame):
         self._build_canvas()
         self._build_controls()
 
-        self._init_walabot()
-        self.after(200, self.start_scan)
+        self.after(200, self._connect_walabot)
 
     # ── Canvas ────────────────────────────────────────────────────────────────
 
@@ -438,9 +437,20 @@ class HarpApp(tk.Frame):
         wlbt.SetThreshold(35)
         wlbt.Start()
 
+    def _connect_walabot(self):
+        """Try to connect; on failure schedule a retry rather than crashing."""
+        try:
+            self._init_walabot()
+            self.after(200, self.start_scan)
+        except wlbt.WalabotError as e:
+            self.statusVar.set(
+                'Walabot not found (code {}) — retrying in 3 s…'.format(e.code))
+            self.after(3000, self._connect_walabot)
+
     def start_scan(self):
-        self.statusVar.set('Warming up...')
-        for _ in range(5):
+        self.statusVar.set('Warming up — keep hands away from sensor...')
+        # 30 warm-up triggers so MTI builds a stable background reference
+        for _ in range(30):
             wlbt.Trigger()
         wlbt.Trigger()
         res = wlbt.GetRawImageSlice()
@@ -510,7 +520,8 @@ class HarpApp(tk.Frame):
             # ── Glow ──────────────────────────────────────────────────────────
             self.pad_countdown[pid] = max(0, self.pad_countdown[pid] - 1)
             ratio_live  = min(1.0, energy / BAR_MAX)
-            ratio_decay = (self.pad_countdown[pid] / NOTE_FRAMES) * 0.35
+            # Decay glow: 100% at trigger → 0% over NOTE_FRAMES (full colour flash)
+            ratio_decay = self.pad_countdown[pid] / NOTE_FRAMES
             ratio = max(ratio_live, ratio_decay)
 
             poly_id, col_idle_c, col_active_c = self.poly_ids[pid]
@@ -562,6 +573,18 @@ def main():
     app = HarpApp(root)
     app.pack()
     root.update_idletasks()
+
+    def _on_close():
+        if app.cycleId:
+            root.after_cancel(app.cycleId)
+        try:
+            wlbt.Stop()
+            wlbt.Disconnect()
+        except Exception:
+            pass
+        root.destroy()
+
+    root.protocol('WM_DELETE_WINDOW', _on_close)
     root.mainloop()
 
 

@@ -6,16 +6,40 @@ Run once before starting the app:
 
 Produces 8 WAV files in the same directory.
 All notes are A minor pentatonic — any combination sounds musical.
+
+Sound design
+------------
+Envelope: 8 ms linear attack, then exponential decay to ~5 % over 3 s.
+          Sounds like a plucked harp string / handpan hit.
+
+Harmonics: each overtone decays at its own rate.
+           Higher harmonics fade faster → bright on the hit, warm as it sustains.
+           Fundamental: normal rate
+           2nd harmonic: 1.5× faster
+           3rd harmonic: 2.5× faster
+           4th harmonic: 4× faster  (brief attack 'click', then gone)
+           This is how real struck / plucked instruments behave.
 """
 import math, wave, struct, os
 
-RATE      = 44100
-DURATION  = 3.0    # seconds — WAV length; NOTE_DURATION in walaharp.py controls looping
-ATTACK    = 0.008  # 8 ms sharp linear attack — percussive pluck feel
-PEAK      = 0.30   # peak amplitude; 4 simultaneous notes sum to ≤1.0 in practice
-# Exponential decay: note falls to exp(-DECAY_RATE) ≈ 5% at end of DURATION
-# This gives a natural harp/handpan pluck: loud on hit, fades smoothly over ~1-2 s
-DECAY_RATE = 3.0
+RATE       = 44100
+DURATION   = 3.0    # seconds — must match NOTE_DURATION logic in walaharp.py
+ATTACK     = 0.008  # 8 ms sharp attack (percussive hit feel)
+PEAK       = 0.30   # peak amplitude; ≤4 simultaneous notes stay below clip in practice
+
+# Exponential decay: fundamental falls to exp(-BASE_DECAY) ≈ 5 % at end of DURATION.
+# Higher harmonics multiply this rate (see HARM_RATES below).
+BASE_DECAY = 3.0
+
+# (frequency_multiple, amplitude_weight, decay_multiplier)
+# weights need not sum to 1 — normalised by the sum below
+_H = [
+    (1.0, 0.70, 1.0),   # fundamental — slowest decay, stays warm
+    (2.0, 0.22, 1.5),   # octave — fades 1.5× faster
+    (3.0, 0.08, 2.5),   # 5th above octave — fades 2.5× faster
+    (4.0, 0.04, 4.0),   # 2nd octave — very fast (bright click at attack only)
+]
+_TOTAL_WEIGHT = sum(w for _, w, _ in _H)
 
 # A minor pentatonic — two octaves, left (low) → right (high)
 NOTES = [
@@ -33,30 +57,25 @@ OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def make_tone(name, freq):
-    n          = int(RATE * DURATION)
-    decay_span = DURATION - ATTACK   # seconds over which exponential runs
+    n         = int(RATE * DURATION)
+    h_span    = DURATION - ATTACK   # seconds over which exponential runs
 
     frames = []
     for i in range(n):
-        t = i / RATE
+        t   = i / RATE
+        h_t = max(0.0, t - ATTACK)   # time elapsed since attack ended
 
-        # Envelope: sharp attack, then natural exponential decay.
-        # Sounds like a plucked harp string: bright on the hit, decays over ~1-2 s.
-        if t < ATTACK:
-            env = t / ATTACK                                          # 0 → 1 ramp
-        else:
-            env = math.exp(-DECAY_RATE * (t - ATTACK) / decay_span)  # 1 → ~0.05
+        # Linear attack ramp (all harmonics together)
+        attack_factor = min(1.0, t / ATTACK)
 
-        env *= PEAK
+        # Sum harmonics with per-harmonic exponential decay
+        sample = 0.0
+        for mult, weight, decay_mult in _H:
+            h_env    = math.exp(-BASE_DECAY * decay_mult * h_t / h_span)
+            h_weight = weight / _TOTAL_WEIGHT
+            sample  += math.sin(2 * math.pi * freq * mult * t) * h_weight * h_env
 
-        # Warm harmonic tone: fundamental + 2nd/3rd overtones
-        # No sub-octave — at high notes it falls in the audible range and distorts
-        sample = (
-            math.sin(2 * math.pi * freq     * t) * 0.70 +
-            math.sin(2 * math.pi * freq * 2 * t) * 0.22 +
-            math.sin(2 * math.pi * freq * 3 * t) * 0.08
-        )
-        frames.append(int(env * sample * 32767))
+        frames.append(int(attack_factor * PEAK * sample * 32767))
 
     path = os.path.join(OUT_DIR, name + '.wav')
     with wave.open(path, 'w') as wf:
@@ -67,12 +86,12 @@ def make_tone(name, freq):
             '<%dh' % n,
             *[max(-32768, min(32767, f)) for f in frames]
         ))
-    print('  {:<5}  {:>7.2f} Hz  ({:.1f}s decay)  → {}'.format(
+    print('  {:<5}  {:>7.2f} Hz  ({:.1f}s)  → {}'.format(
         name, freq, DURATION, os.path.basename(path)))
 
 
 if __name__ == '__main__':
-    print('Generating WalaHarp tones (A minor pentatonic, exponential decay)...')
+    print('Generating WalaHarp tones (A minor pentatonic, differential harmonic decay)...')
     for name, freq in NOTES:
         make_tone(name, freq)
     print('Done.')
