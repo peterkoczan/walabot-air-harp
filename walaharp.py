@@ -198,7 +198,7 @@ PADS = [
 ]
 
 # ── Detection / sustain constants ─────────────────────────────────────────────
-ENERGY_THRESHOLD = 500   # adjustable via slider — higher default without MTI
+ENERGY_THRESHOLD = 300   # adjustable via slider
 BAR_MAX          = 1500  # energy level that maxes out the glow
 
 # Far zone boost — signal attenuates ~R^4; hands at 90 cm return far less energy
@@ -440,11 +440,11 @@ class HarpApp(tk.Frame):
         wlbt.SetArenaR(R_MIN, R_MAX, R_RES)
         wlbt.SetArenaPhi(PHI_MIN, PHI_MAX, PHI_RES)
         wlbt.SetArenaTheta(THETA_MIN, THETA_MAX, THETA_RES)
-        # FILTER_TYPE_NONE: raw signal after calibration baseline.
-        # MTI (derivative filter) only sees MOVING targets; a held hand fades
-        # to zero after 2-3 frames — exactly why sustained notes kept cutting out.
-        # With no filter, a held hand produces continuous energy above threshold.
-        wlbt.SetDynamicImageFilter(wlbt.FILTER_TYPE_NONE)
+        # MTI (Moving Target Indicator) = temporal derivative filter.
+        # Detects MOVEMENT, not static presence — a still hand fades to zero.
+        # This is correct for the harp: wave your hands through zones to play;
+        # keep hands gently moving to sustain; stop moving → note fades out.
+        wlbt.SetDynamicImageFilter(wlbt.FILTER_TYPE_MTI)
         wlbt.SetThreshold(35)
         wlbt.Start()
 
@@ -469,7 +469,7 @@ class HarpApp(tk.Frame):
             range(3*q + 1, sY),       # full outer-right (no roll strip)
         ]
 
-        self.statusVar.set('Ready — wave hands above the sensor')
+        self.statusVar.set('Ready — wave hands above zones to play; keep moving to sustain')
         self.cycleId = self.after(LOOP_MS, self.loop)
 
     def loop(self):
@@ -562,7 +562,7 @@ class HarpApp(tk.Frame):
             self.statusVar.set('\u266a  {}  \u2014  {}'.format(
                 '   '.join(playing), hands))
         else:
-            self.statusVar.set('Ready \u2014 place both hands above the sensor')
+            self.statusVar.set('Ready \u2014 wave hands above zones  \u00b7  keep moving to sustain')
 
         self.cycleId = self.after(LOOP_MS, self.loop)
 
