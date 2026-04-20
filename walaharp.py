@@ -187,8 +187,8 @@ PADS = [
 ]
 
 # ── Detection / sustain constants ─────────────────────────────────────────────
-ENERGY_THRESHOLD = 300   # adjustable via slider
-BAR_MAX          = 1500  # energy level that maxes out the glow
+ENERGY_THRESHOLD = 200   # adjustable via slider (lower = more sensitive)
+BAR_MAX          = 1200  # energy level that maxes out the glow
 
 # Far zone boost — signal attenuates ~R^4; hands at 90 cm return far less energy
 FAR_BOOST        = 5.0
@@ -375,7 +375,7 @@ class HarpApp(tk.Frame):
                  bg='#0a0a0a', fg='#555').pack(side=tk.LEFT, padx=(0, 4))
         self.threshVar = tk.IntVar(value=ENERGY_THRESHOLD)
         self.threshVar.trace_add('write', self._on_threshold_change)
-        tk.Scale(bar, from_=50, to=1000, orient=tk.HORIZONTAL,
+        tk.Scale(bar, from_=30, to=800, orient=tk.HORIZONTAL,
                  variable=self.threshVar, showvalue=True,
                  bg='#0a0a0a', fg='#888888', troughcolor='#1a1a1a',
                  activebackground='#444', highlightthickness=0,
@@ -526,6 +526,9 @@ class HarpApp(tk.Frame):
 
             poly_id, col_idle_c, col_active_c = self.poly_ids[pid]
             self.canvas.itemconfig(poly_id, fill=_blend(col_idle_c, col_active_c, ratio))
+            # Label glows from dim grey → bright white with pad
+            self.canvas.itemconfig(self.label_ids[pid],
+                                   fill=_blend('#333333', '#ffffff', ratio))
 
             # ── Sustain / retrigger ───────────────────────────────────────────
             if pid in active:
