@@ -13,7 +13,7 @@ RATE     = 44100
 DURATION = 2.5    # seconds — must match NOTE_DURATION in walaharp.py
 ATTACK   = 0.06   # 60 ms linear attack
 RELEASE  = 0.80   # 800 ms release
-PEAK     = 0.82   # peak amplitude (keeps headroom for mixing)
+PEAK     = 0.50   # peak amplitude — headroom for 3-4 simultaneous notes in mixer
 
 # A minor pentatonic — two octaves, left (low) → right (high)
 NOTES = [
@@ -47,12 +47,12 @@ def make_tone(name, freq):
             env = 1.0
         env *= PEAK
 
-        # Warm harmonic tone: fundamental + overtones + soft sub-octave
+        # Warm harmonic tone: fundamental + 2nd/3rd overtones
+        # No sub-octave — at high notes it falls in the audible range and distorts
         sample = (
-            math.sin(2 * math.pi * freq       * t) * 0.60 +
-            math.sin(2 * math.pi * freq * 2   * t) * 0.20 +
-            math.sin(2 * math.pi * freq * 3   * t) * 0.10 +
-            math.sin(2 * math.pi * freq * 0.5 * t) * 0.10   # sub-octave warmth
+            math.sin(2 * math.pi * freq     * t) * 0.70 +
+            math.sin(2 * math.pi * freq * 2 * t) * 0.22 +
+            math.sin(2 * math.pi * freq * 3 * t) * 0.08
         )
         frames.append(int(env * sample * 32767))
 
