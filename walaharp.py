@@ -210,10 +210,13 @@ FAR_BOOST        = 5.0
 NOTE_DURATION    = 2.5          # seconds — must match generate_sounds.py DURATION
 LOOP_MS          = 20           # ms between Walabot frames (~50 fps)
 NOTE_FRAMES      = int(NOTE_DURATION * 1000 / LOOP_MS)   # 125 frames
-# Retrigger when 120 ms remain — old note is at ~15% amplitude in its release
-# tail, barely audible.  Combined with stop-on-retrigger this gives a clean
-# seamless loop with zero phase-overlap distortion.
-RETRIGGER_FRAMES = int(0.12     * 1000 / LOOP_MS)        #   6  frames (last 120ms)
+RETRIGGER_FRAMES = int(0.12     * 1000 / LOOP_MS)        #   6  frames (safety fallback)
+
+# How many frames to keep a pad "retrigger-eligible" after its last good
+# detection.  A second hand entering the radar field can disturb the first
+# zone's signal for 3-8 frames (~60-160 ms).  This hold window keeps the
+# sustain loop intact across those brief drops.
+SUSTAIN_HOLD = 10   # frames ≈ 200 ms
 
 # ── Walabot arena ─────────────────────────────────────────────────────────────
 R_MIN, R_MAX, R_RES             = 20, 90, 5   # 20–90 cm: hands low → hands raised high
@@ -284,6 +287,9 @@ class HarpApp(tk.Frame):
         self.phi_ranges    = None
         self.threshold     = ENERGY_THRESHOLD
         self.mode          = '2-HAND'  # '1-HAND' or '2-HAND'
+        # Sustain-hold counters: stay > 0 for SUSTAIN_HOLD frames after last
+        # detection so brief radar drops don't cut the retrigger loop
+        self.pad_hold      = {p[0]: 0 for p in PADS}
 
         self.statusVar = tk.StringVar(value='Connecting...')
         tk.Label(self, textvariable=self.statusVar, font='TkFixedFont 9',
@@ -468,7 +474,7 @@ class HarpApp(tk.Frame):
         img    = res[0]
         thresh = self.threshold
 
-        # ── Compute energies for all pads ─────────────────────────────────────
+        # ── Compute energies ──────────────────────────────────────────────────
         energies = {}
         for pid, label, r_idx, phi_idx, col_idle, col_active, wav, boost in PADS:
             r_rng   = self.r_ranges[r_idx]
@@ -479,19 +485,34 @@ class HarpApp(tk.Frame):
             e *= boost
             energies[pid] = e
 
-        # ── 1-HAND mode: only fire the single loudest zone above threshold ────
+        # ── 1-HAND vs 2-HAND mode ─────────────────────────────────────────────
         if self.mode == '1-HAND':
             best_pid = max(energies, key=lambda p: energies[p])
-            allowed  = {best_pid} if energies[best_pid] > thresh else set()
+            active   = {best_pid} if energies[best_pid] > thresh else set()
+            # Explicit zone-switch cut (intentional, not a brief drop)
+            prev = getattr(self, '_prev_best_pid', None)
+            if best_pid != prev and prev is not None:
+                _stop(self.pad_wavobj.get(prev))
+            self._prev_best_pid = best_pid if energies[best_pid] > thresh else None
         else:
-            allowed = {pid for pid, e in energies.items() if e > thresh}
+            active = {pid for pid, e in energies.items() if e > thresh}
 
-        playing     = []
-        left_active = False
-        right_active= False
+        playing      = []
+        left_active  = False
+        right_active = False
 
         for pid, label, r_idx, phi_idx, col_idle, col_active, wav, boost in PADS:
             energy = energies[pid]
+
+            # ── Sustain-hold counter ──────────────────────────────────────────
+            # When a second hand enters the radar field it can disturb this
+            # zone's signal for several frames.  The hold keeps the note
+            # retrigger-eligible for SUSTAIN_HOLD frames after last good detection
+            # so a brief energy drop never breaks the sustain loop.
+            if pid in active:
+                self.pad_hold[pid] = SUSTAIN_HOLD
+            else:
+                self.pad_hold[pid] = max(0, self.pad_hold[pid] - 1)
 
             # ── Glow ──────────────────────────────────────────────────────────
             self.pad_countdown[pid] = max(0, self.pad_countdown[pid] - 1)
@@ -503,27 +524,26 @@ class HarpApp(tk.Frame):
             self.canvas.itemconfig(poly_id, fill=_blend(col_idle_c, col_active_c, ratio))
 
             # ── Sustain / retrigger ───────────────────────────────────────────
-            if pid in allowed:
+            if pid in active:
                 playing.append(label)
                 if phi_idx <= 1:
                     left_active  = True
                 else:
                     right_active = True
 
-                # Retrigger when the wav itself is nearly exhausted (sample-accurate)
-                # OR when the frame countdown hits its threshold (safety fallback).
-                # Using actual wav position avoids the timing drift between the
-                # mixer thread and the scan loop that caused notes to cut short.
-                rem_ms = _remaining_ms(self.pad_wavobj[pid])
-                near_end = (rem_ms < 120) or (self.pad_countdown[pid] <= RETRIGGER_FRAMES)
-                if near_end:
-                    # Stop old wav first (prevents phase-overlap distortion when two
-                    # copies of the same frequency play simultaneously)
-                    _stop(self.pad_wavobj[pid])
-                    self.pad_wavobj[pid] = _play(wav)
-                    self.pad_hits[pid]  += 1
-                    self.pad_countdown[pid] = NOTE_FRAMES
-            # If not active: note decays naturally via its remaining wav data
+            # Retrigger when the wav is nearly finished (sample-accurate).
+            # The pad must be actively detected OR still within its hold window.
+            # This guards against brief interference drops WITHOUT causing
+            # infinite sustain (hold expires after SUSTAIN_HOLD frames).
+            # No _stop() here — the last 50ms at < 3% amplitude is inaudible;
+            # starting the new wav silently alongside it avoids any abrupt cut.
+            rem_ms   = _remaining_ms(self.pad_wavobj[pid])
+            near_end = rem_ms < 50   # <50 ms remaining, or wav not started yet
+            if near_end and (pid in active or self.pad_hold[pid] > 0):
+                self.pad_wavobj[pid] = _play(wav)
+                self.pad_hits[pid]  += 1
+                self.pad_countdown[pid] = NOTE_FRAMES
+            # Note plays out naturally when neither active nor in hold window
 
         # ── Hand indicator lights ─────────────────────────────────────────────
         self.canvas.itemconfig(self.hand_left_id,
