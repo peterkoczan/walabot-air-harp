@@ -77,6 +77,18 @@ class _Mixer:
             except (ValueError, Exception):
                 pass   # already finished naturally — no-op
 
+    def remaining_ms(self, wf):
+        """Return milliseconds of audio remaining in a wav stream.
+        Thread-safe: acquires the lock while reading the wav position."""
+        if wf is None:
+            return 0
+        with self._lock:
+            try:
+                remaining = max(0, wf.getnframes() - wf.tell())
+                return remaining / self.RATE * 1000
+            except Exception:
+                return 0
+
     def _run(self):
         """Real-time paced loop: keeps the OS pipe near-empty so audio plays
         within ~10 ms of a hit instead of waiting for buffered silence to drain."""
@@ -145,17 +157,20 @@ class _Mixer:
 
 if _SYSTEM == 'Linux':
     _mixer = _Mixer()
-    def _play(path):  return _mixer.play(path)   # returns wave obj
-    def _stop(wf):    _mixer.stop(wf)
+    def _play(path):         return _mixer.play(path)
+    def _stop(wf):           _mixer.stop(wf)
+    def _remaining_ms(wf):   return _mixer.remaining_ms(wf)
 elif _SYSTEM == 'Darwin':
     def _play(path):
         subprocess.Popen(['afplay', path],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return None
-    def _stop(wf):    pass
+    def _stop(wf):           pass
+    def _remaining_ms(wf):   return 0
 else:
-    def _play(path):  return None
-    def _stop(wf):    pass
+    def _play(path):         return None
+    def _stop(wf):           pass
+    def _remaining_ms(wf):   return 0
 
 # ── Note / pad definitions ────────────────────────────────────────────────────
 # Handpan alternating-hand layout (ascending L→R across the scale):
@@ -268,6 +283,7 @@ class HarpApp(tk.Frame):
         self.r_ranges      = None
         self.phi_ranges    = None
         self.threshold     = ENERGY_THRESHOLD
+        self.mode          = '2-HAND'  # '1-HAND' or '2-HAND'
 
         self.statusVar = tk.StringVar(value='Connecting...')
         tk.Label(self, textvariable=self.statusVar, font='TkFixedFont 9',
@@ -371,6 +387,14 @@ class HarpApp(tk.Frame):
                  font='TkFixedFont 7', length=440, sliderlength=12,
                  bd=0).pack(side=tk.LEFT)
 
+        self.modeVar = tk.StringVar(value='2-HAND')
+        self.modeBtn = tk.Button(bar, textvariable=self.modeVar,
+                  font='TkFixedFont 8 bold',
+                  bg='#1a2a1a', fg='#44cc44', activebackground='#2a3a2a',
+                  activeforeground='#66ff66', relief=tk.FLAT, bd=1,
+                  padx=8, command=self._toggle_mode)
+        self.modeBtn.pack(side=tk.RIGHT, padx=(4, 0))
+
         tk.Button(bar, text='RESET', font='TkFixedFont 8',
                   bg='#1a1a1a', fg='#888888', activebackground='#333',
                   activeforeground='#ffffff', relief=tk.FLAT, bd=1,
@@ -383,6 +407,20 @@ class HarpApp(tk.Frame):
             self.threshold = self.threshVar.get()
         except Exception:
             pass
+
+    def _toggle_mode(self):
+        if self.mode == '2-HAND':
+            self.mode = '1-HAND'
+            self.modeVar.set('1-HAND')
+            self.modeBtn.config(bg='#1a1a2a', fg='#4488cc',
+                                activebackground='#2a2a3a',
+                                activeforeground='#66aaff')
+        else:
+            self.mode = '2-HAND'
+            self.modeVar.set('2-HAND')
+            self.modeBtn.config(bg='#1a2a1a', fg='#44cc44',
+                                activebackground='#2a3a2a',
+                                activeforeground='#66ff66')
 
     def _reset(self):
         for pid in self.pad_hits:
@@ -430,22 +468,32 @@ class HarpApp(tk.Frame):
         img    = res[0]
         thresh = self.threshold
 
-        playing     = []
-        left_active = False   # any left-side (phi_idx 0 or 1) pad above threshold
-        right_active= False   # any right-side (phi_idx 2 or 3) pad above threshold
-
+        # ── Compute energies for all pads ─────────────────────────────────────
+        energies = {}
         for pid, label, r_idx, phi_idx, col_idle, col_active, wav, boost in PADS:
             r_rng   = self.r_ranges[r_idx]
             phi_rng = self.phi_ranges[phi_idx]
-            energy  = sum(img[i][j] for i in r_rng for j in phi_rng)
+            e       = sum(img[i][j] for i in r_rng for j in phi_rng)
             if r_idx == 1:
-                energy *= FAR_BOOST
-            energy *= boost   # per-pad outer-angle compensation
+                e *= FAR_BOOST
+            e *= boost
+            energies[pid] = e
+
+        # ── 1-HAND mode: only fire the single loudest zone above threshold ────
+        if self.mode == '1-HAND':
+            best_pid = max(energies, key=lambda p: energies[p])
+            allowed  = {best_pid} if energies[best_pid] > thresh else set()
+        else:
+            allowed = {pid for pid, e in energies.items() if e > thresh}
+
+        playing     = []
+        left_active = False
+        right_active= False
+
+        for pid, label, r_idx, phi_idx, col_idle, col_active, wav, boost in PADS:
+            energy = energies[pid]
 
             # ── Glow ──────────────────────────────────────────────────────────
-            # Primary glow tracks live energy.
-            # Secondary "decay glow" tracks countdown (note still sounding after
-            # hand leaves) at 35% brightness so the listener can see it.
             self.pad_countdown[pid] = max(0, self.pad_countdown[pid] - 1)
             ratio_live  = min(1.0, energy / BAR_MAX)
             ratio_decay = (self.pad_countdown[pid] / NOTE_FRAMES) * 0.35
@@ -455,21 +503,27 @@ class HarpApp(tk.Frame):
             self.canvas.itemconfig(poly_id, fill=_blend(col_idle_c, col_active_c, ratio))
 
             # ── Sustain / retrigger ───────────────────────────────────────────
-            if energy > thresh:
+            if pid in allowed:
                 playing.append(label)
                 if phi_idx <= 1:
                     left_active  = True
                 else:
                     right_active = True
-                if self.pad_countdown[pid] <= RETRIGGER_FRAMES:
-                    # Stop old instance first — prevents two copies of the same
-                    # frequency running simultaneously (phase-overlap distortion)
+
+                # Retrigger when the wav itself is nearly exhausted (sample-accurate)
+                # OR when the frame countdown hits its threshold (safety fallback).
+                # Using actual wav position avoids the timing drift between the
+                # mixer thread and the scan loop that caused notes to cut short.
+                rem_ms = _remaining_ms(self.pad_wavobj[pid])
+                near_end = (rem_ms < 120) or (self.pad_countdown[pid] <= RETRIGGER_FRAMES)
+                if near_end:
+                    # Stop old wav first (prevents phase-overlap distortion when two
+                    # copies of the same frequency play simultaneously)
                     _stop(self.pad_wavobj[pid])
                     self.pad_wavobj[pid] = _play(wav)
                     self.pad_hits[pid]  += 1
                     self.pad_countdown[pid] = NOTE_FRAMES
-            # If energy gone: note plays out its remaining countdown naturally
-            # (pad_wavobj is left alone — the wave drains to silence by itself)
+            # If not active: note decays naturally via its remaining wav data
 
         # ── Hand indicator lights ─────────────────────────────────────────────
         self.canvas.itemconfig(self.hand_left_id,
