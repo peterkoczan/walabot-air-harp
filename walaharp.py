@@ -48,6 +48,17 @@ _NOTE_FREQ = {
     'g4': 392.00, 'a4': 440.00, 'c5': 523.25, 'e5': 659.25,
 }
 
+# Ascending pad order for tuning frequency assignment
+_PADS_ASCENDING = ['a3', 'c4', 'd4', 'e4', 'g4', 'a4', 'c5', 'e5']
+
+# 4 tuning presets — frequencies assigned to pads in ascending pitch order
+_TUNINGS = {
+    1: ('A min pent',     [220.00, 261.63, 293.66, 329.63, 392.00, 440.00, 523.25, 659.25]),
+    2: ('Gamelan Slendro',[220.00, 252.50, 290.30, 333.50, 382.90, 440.00, 505.00, 580.60]),
+    3: ('Pythagorean',    [220.00, 247.50, 278.44, 293.33, 330.00, 371.25, 417.66, 440.00]),
+    4: ('Blues hex',      [220.00, 261.63, 293.66, 311.13, 329.63, 392.00, 440.00, 523.25]),
+}
+
 _KS_CACHE = {}   # {freq: numpy int16 array of PCM samples}
 
 
@@ -457,6 +468,9 @@ class HarpApp(tk.Frame):
         # making notes immune to any duration of radar interference from a
         # second hand — no hold-window expiry, just a real-time clock check.
         self.pad_last_active = {p[0]: 0.0 for p in PADS}
+        # Current tuning: per-pad frequency (overrides _NOTE_FREQ when tuning changes)
+        self.tuning_id = 1
+        self.pad_freq  = dict(_NOTE_FREQ)
         # Schmitt trigger state: True while pad is considered "active" (hysteresis)
         self.pad_is_active   = {p[0]: False for p in PADS}
         # Energy from the previous frame — used for velocity gate
@@ -601,6 +615,13 @@ class HarpApp(tk.Frame):
                   activeforeground='#ffffff', relief=tk.FLAT, bd=1,
                   padx=8, command=self._reset).pack(side=tk.RIGHT, padx=(8, 0))
 
+        # Second row: tuning indicator
+        bar2 = tk.Frame(self, bg='#0a0a0a')
+        bar2.pack(fill=tk.X, padx=8, pady=(0, 2))
+        self.tuningVar = tk.StringVar(value='Tuning: A min pent  [1] pent  [2] slendro  [3] pyth  [4] blues  [k] KS/WAV')
+        tk.Label(bar2, textvariable=self.tuningVar, font='TkFixedFont 7',
+                 bg='#0a0a0a', fg='#445544', anchor=tk.W).pack(side=tk.LEFT)
+
     # ── Walabot ───────────────────────────────────────────────────────────────
 
     def _on_threshold_change(self, *args):
@@ -653,11 +674,26 @@ class HarpApp(tk.Frame):
                                                   note=_PAD_MIDI_NOTE[pid], velocity=0))
                     self.midi_note_on[pid] = False
 
+    def _switch_tuning(self, n, _event=None):
+        if n not in _TUNINGS:
+            return
+        name, freqs = _TUNINGS[n]
+        self.tuning_id = n
+        for pid, freq in zip(_PADS_ASCENDING, freqs):
+            self.pad_freq[pid] = freq
+        if KS_MODE and _NUMPY_OK:
+            _KS_CACHE.clear()
+            for freq in freqs:
+                _ks_ensure(freq)
+        ks_label = 'KS' if KS_MODE else 'WAV'
+        self.tuningVar.set('Tuning: {}  [1-4] switch  [k] {}'.format(name, ks_label))
+
     def _toggle_ks(self, _event=None):
         global KS_MODE
         KS_MODE = not KS_MODE
-        label = 'KS' if KS_MODE else 'WAV'
-        self.statusVar.set('Synthesis: {} mode'.format(label))
+        name, _ = _TUNINGS[self.tuning_id]
+        ks_label = 'KS' if KS_MODE else 'WAV'
+        self.tuningVar.set('Tuning: {}  [1-4] switch  [k] {}'.format(name, ks_label))
 
     def _init_walabot(self):
         wlbt.Init()
@@ -690,8 +726,8 @@ class HarpApp(tk.Frame):
         # Pre-generate KS buffers while warming up (8 notes, ~100 ms each)
         if KS_MODE and _NUMPY_OK:
             self.statusVar.set('Warming up — generating KS buffers...')
-            for pid, _, _, _, _, _, _, _ in PADS:
-                _ks_ensure(_NOTE_FREQ[pid])
+            for pid in self.pad_freq:
+                _ks_ensure(self.pad_freq[pid])
         # 30 warm-up triggers so MTI builds a stable background reference
         for _ in range(30):
             wlbt.Trigger()
@@ -832,8 +868,8 @@ class HarpApp(tk.Frame):
             recently_active = (now - self.pad_last_active[pid]) < NOTE_DURATION
             if near_end and recently_active:
                 pan_l, pan_r = _phi_pan(phi_idx)
-                if KS_MODE and _NUMPY_OK and pid in _NOTE_FREQ:
-                    self.pad_wavobj[pid] = _play_ks(_NOTE_FREQ[pid], pan_l, pan_r)
+                if KS_MODE and _NUMPY_OK:
+                    self.pad_wavobj[pid] = _play_ks(self.pad_freq.get(pid, _NOTE_FREQ.get(pid, 440.0)), pan_l, pan_r)
                 else:
                     self.pad_wavobj[pid] = _play(wav, pan_l, pan_r)
                 self.pad_hits[pid]  += 1
@@ -906,6 +942,8 @@ def main():
     root.bind('d', app._toggle_debug)
     root.bind('m', app._toggle_midi)
     root.bind('k', app._toggle_ks)
+    for n in range(1, 5):
+        root.bind(str(n), lambda e, _n=n: app._switch_tuning(_n))
     root.update_idletasks()
 
     def _on_close():
