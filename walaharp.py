@@ -51,12 +51,27 @@ class _Mixer:
         threading.Thread(target=self._run, daemon=True).start()
 
     def play(self, path):
+        """Open WAV and add to mix.  Returns the wave object so the caller
+        can stop it later via stop()."""
         try:
             wf = wave.open(path, 'rb')
             with self._lock:
                 self._streams.append(wf)
+            return wf
         except Exception:
-            pass
+            return None
+
+    def stop(self, wf):
+        """Remove a specific wave stream from the mix immediately.
+        Safe to call with None or an already-finished stream."""
+        if wf is None:
+            return
+        with self._lock:
+            try:
+                self._streams.remove(wf)
+                wf.close()
+            except (ValueError, Exception):
+                pass   # already finished naturally — no-op
 
     def _run(self):
         silence = b'\x00' * self.CHUNK * 2
@@ -96,13 +111,17 @@ class _Mixer:
 
 if _SYSTEM == 'Linux':
     _mixer = _Mixer()
-    def _play(path): _mixer.play(path)
+    def _play(path):  return _mixer.play(path)   # returns wave obj
+    def _stop(wf):    _mixer.stop(wf)
 elif _SYSTEM == 'Darwin':
     def _play(path):
         subprocess.Popen(['afplay', path],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return None
+    def _stop(wf):    pass
 else:
-    def _play(path): pass
+    def _play(path):  return None
+    def _stop(wf):    pass
 
 # ── Note / pad definitions ────────────────────────────────────────────────────
 # (id, label, r_idx 0=near/1=far, phi_idx 0=outer-left…3=outer-right,
@@ -137,7 +156,10 @@ FAR_BOOST        = 5.0
 NOTE_DURATION    = 2.5          # seconds — must match generate_sounds.py DURATION
 LOOP_MS          = 20           # ms between Walabot frames (~50 fps)
 NOTE_FRAMES      = int(NOTE_DURATION * 1000 / LOOP_MS)   # 125 frames
-RETRIGGER_FRAMES = int(0.5      * 1000 / LOOP_MS)        # 25  frames (last 500ms)
+# Retrigger when 120 ms remain — old note is at ~15% amplitude in its release
+# tail, barely audible.  Combined with stop-on-retrigger this gives a clean
+# seamless loop with zero phase-overlap distortion.
+RETRIGGER_FRAMES = int(0.12     * 1000 / LOOP_MS)        #   6  frames (last 120ms)
 
 # ── Walabot arena ─────────────────────────────────────────────────────────────
 R_MIN, R_MAX, R_RES             = 20, 90, 5   # 20–90 cm: hands low → hands raised high
@@ -194,8 +216,11 @@ class HarpApp(tk.Frame):
     def __init__(self, master):
         tk.Frame.__init__(self, master, bg='#0a0a0a')
         # Per-pad: countdown in frames until the current note ends naturally
-        self.pad_countdown = {p[0]: 0   for p in PADS}
-        self.pad_hits      = {p[0]: 0   for p in PADS}
+        self.pad_countdown = {p[0]: 0    for p in PADS}
+        self.pad_hits      = {p[0]: 0    for p in PADS}
+        # Track the current wave object per pad so we can stop it cleanly
+        # before retriggering (prevents two copies of the same freq interfering)
+        self.pad_wavobj    = {p[0]: None for p in PADS}
         self.cycleId       = None
         self.r_ranges      = None
         self.phi_ranges    = None
@@ -371,12 +396,15 @@ class HarpApp(tk.Frame):
             # ── Sustain / retrigger ───────────────────────────────────────────
             if energy > thresh:
                 playing.append(label)
-                # Retrigger when note is within its last 500 ms (or silent)
                 if self.pad_countdown[pid] <= RETRIGGER_FRAMES:
-                    _play(wav)
-                    self.pad_hits[pid] += 1
+                    # Stop old instance first — prevents two copies of the same
+                    # frequency running simultaneously (phase-overlap distortion)
+                    _stop(self.pad_wavobj[pid])
+                    self.pad_wavobj[pid] = _play(wav)
+                    self.pad_hits[pid]  += 1
                     self.pad_countdown[pid] = NOTE_FRAMES
             # If energy gone: note plays out its remaining countdown naturally
+            # (pad_wavobj is left alone — the wave drains to silence by itself)
 
         # Status bar shows currently sounding notes
         if playing:

@@ -11,7 +11,7 @@ import math, wave, struct, os
 
 RATE     = 44100
 DURATION = 2.5    # seconds — must match NOTE_DURATION in walaharp.py
-ATTACK   = 0.06   # 60 ms linear attack
+ATTACK   = 0.015  # 15 ms linear attack — fast enough to feel instant, no click
 RELEASE  = 0.80   # 800 ms release
 PEAK     = 0.40   # peak amplitude — 2 notes sum to 0.80, mixer peak-limits the rest
 
